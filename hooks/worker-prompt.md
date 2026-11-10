@@ -97,10 +97,10 @@
    如果 payload.failingBot 存在：回复完用户消息后，再按第 2 条对这个通道做诊断。
    【回复发出后写历史】本轮全部回复发完后，把这一轮追加进 $D/current.jsonl（指令轮不写）：
    - 先数已有行数作为起始 seq（wc -l < $D/current.jsonl），之后每写一行 seq 加一。
-   - 对方每条消息一行：{"ts": <消息时间，没有就用当前北京时间>, "seq": n, "role": "user", "text": <原文>}。带媒体的消息 text 写占位：图片「[图片]」、语音「[语音] <服务端转写文字>」、视频「[视频]」、文件「[文件] <文件名>」。
+   - 对方每条消息一行：{"ts": <消息时间，没有就用当前北京时间>, "seq": n, "role": "user", "text": <原文>}。带媒体的消息 text 写占位：图片「[图片]」、语音「[语音] <服务端转写文字>」、视频「[视频]」、文件「[文件] <文件名>」。这条消息带媒体、且 payload 里该媒体带 localPath 时，这一行还要多带一个 media 字段：[{"kind": <该媒体的 kind>, "localPath": <该媒体的 localPath>}]，一条消息有几个带 localPath 的媒体就放几个，没有 localPath 的媒体不放进 media。media 字段是给会话查看器直接显示图片、视频和播放语音用的，路径必须照 payload 原样抄，不许改写。
    - 你每条回复一行：role 为 "assistant"，text 是你实际发出的回复原文（一字不差，以 send 发出的为准）。
    - ts 一律用北京时间 ISO 格式，如 2026-11-10T16:30:00+08:00。
-   - 写行必须用 jq 生成，逐行追加：jq -cn --arg ts '<ts>' --argjson seq <n> --arg role '<role>' --arg text '<文本>' '{ts:$ts,seq:$seq,role:$role,text:$text}' >> $D/current.jsonl。不许手拼 JSON 字符串。
+   - 写行必须用 jq 生成，逐行追加：jq -cn --arg ts '<ts>' --argjson seq <n> --arg role '<role>' --arg text '<文本>' '{ts:$ts,seq:$seq,role:$role,text:$text}' >> $D/current.jsonl。不许手拼 JSON 字符串。带 media 字段的行改用这个命令：jq -cn --arg ts '<ts>' --argjson seq <n> --arg role '<role>' --arg text '<文本>' --argjson media '<media 数组的 JSON 文本>' '{ts:$ts,seq:$seq,role:$role,text:$text,media:$media}' >> $D/current.jsonl。
    - 写完历史，最后执行 rm -f <payload.lockFile> 释放这个对话的工作锁（顺序不要反），否则这个人的后续消息会被卡住（锁 300 秒后会自动清理）。指令轮同样要释放锁。
 
 2. reason 是 wechat_poll_failing：本窗口轮询连续失败 10 次（payload 有 botId/botLabel）。

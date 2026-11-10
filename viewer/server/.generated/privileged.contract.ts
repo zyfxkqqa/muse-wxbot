@@ -40,8 +40,27 @@ export const WechatPrivileged = definePrivilegedContracts({
           ts: z.string(),
           role: z.string(),
           text: z.string(),
+          media: z
+            .array(
+              z.object({
+                kind: z.string(),
+                localPath: z.string(),
+              }),
+            )
+            .optional(),
         }),
       ),
+    }),
+  },
+  getMediaFile: {
+    request: z.object({
+      localPath: z.string(),
+    }),
+    response: z.object({
+      found: z.boolean(),
+      mime: z.string(),
+      base64: z.string(),
+      size: z.number(),
     }),
   },
 });

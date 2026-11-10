@@ -26,7 +26,6 @@ const botShape = z.object({
   label: z.string(),
   displayName: z.string(),
   platformBotId: z.string(),
-  ownerExternalId: z.string(),
   createdAt: z.string(),
   lastError: z.string().nullable(),
   remark: z.string(),
@@ -47,6 +46,14 @@ const messagesResponse = z.object({
       ts: z.string(),
       role: z.string(),
       text: z.string(),
+      media: z
+        .array(
+          z.object({
+            kind: z.string(),
+            localPath: z.string(),
+          }),
+        )
+        .optional(),
     }),
   ),
 });
@@ -75,6 +82,10 @@ export const Actions = {
       );
       return {
         bots: live.bots.map((bot) => {
+          // ownerExternalId is only needed host-side (it keys the history
+          // folder); the client never uses it, so it stays out of the
+          // response.
+          const { ownerExternalId: _ownerExternalId, ...botFields } = bot;
           const conversations = bot.conversations.map((c) => {
             const seen = Math.min(
               seenByKey.get(`${bot.id}|${c.id}`) ?? 0,
@@ -83,7 +94,7 @@ export const Actions = {
             return { ...c, unreadCount: c.messageCount - seen };
           });
           return {
-            ...bot,
+            ...botFields,
             remark: remarkByBot.get(bot.id) ?? "",
             conversations,
             unreadTotal: conversations.reduce(
@@ -111,6 +122,31 @@ export const Actions = {
       return ctx.executePrivileged(WechatPrivileged.getConversationMessages, {
         botId: args.botId,
         conversationId: args.conversationId,
+      });
+    },
+  }),
+
+  getMedia: defineAction({
+    description:
+      "Returns one media file (image/video/voice/file) from the bot's media folder as base64, so the viewer can display it. Only files under ~/workspace/wechat-media/ are served.",
+    request: z.object({
+      localPath: z.string().min(1),
+    }),
+    response: z.object({
+      found: z.boolean(),
+      mime: z.string(),
+      base64: z.string(),
+      size: z.number(),
+    }),
+    privileged: [WechatPrivileged.getMediaFile],
+    async handler(ctx, args): Promise<{
+      found: boolean;
+      mime: string;
+      base64: string;
+      size: number;
+    }> {
+      return ctx.executePrivileged(WechatPrivileged.getMediaFile, {
+        localPath: args.localPath,
       });
     },
   }),

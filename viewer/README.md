@@ -14,6 +14,7 @@ Muse 的网页构件（Space，全栈 TypeScript）：在侧边栏打开，查�
 - 「当前」徽章是蓝色（与绿色按钮、红色未读区分）。
 - 头像不是真照片：白气泡旁深色「Muse」文字块、绿气泡旁绿色「微信」文字块。
 - 机器人行显示绑定状态（已绑定 / 最近有报错）与对话数。
+- 媒体显示：历史行带 `media` 字段（`[{kind, localPath}]`）时，图片直接显示、视频放播放器（可播放）、文件显示文件名、点击后才下载；语音在同目录有同名 `.mp3` 转码时显示可播放的语音条，否则显示语音标识（转写在文字里）。纯媒体消息的占位文字（`[图片]` / `[视频]`）不再单独显示，搜索也不会把它们计入命中。媒体文件由后端按需读取（只读 `~/workspace/wechat-media/` 下面、单个不超过 50MB 的文件，先看大小再读入），前端按 localPath 缓存，不会每次同步都重下。
 
 ## 它读什么（数据约定）
 
@@ -22,7 +23,7 @@ Muse 的网页构件（Space，全栈 TypeScript）：在侧边栏打开，查�
 - 绑定：`~/workspace/skills/wechat-bot/state/bindings.json`（一个数组；每条只取 `id`、`label` / `displayName`、`platformBotId`、`ownerExternalId`、`createdAt`、`metadata.lastError`）。token 与游标（`metadata.getUpdatesBuf`）绝不返回给前端。
 - 会话历史：`~/hooks/state/wechat-convs/<sha>/`，其中 `sha` = `sha256("<botId>:<ownerExternalId>")` 的前 16 位十六进制字符。每个文件夹内有：
   - `meta.json`：对话清单（编号按创建顺序固定）、`current_id`、翻页位置
-  - `current.jsonl`：当前对话，一行一条（`ts`、`seq`、`role`、`text`）
+  - `current.jsonl`：当前对话，一行一条（`ts`、`seq`、`role`、`text`）。带媒体的用户消息那行还多一个 `media` 字段（`[{"kind":"image|voice|video|file","localPath":"<绝对路径>"}]`，`localPath` 是 hook 下载到本地的附件路径）；查看器按这个字段显示图片/视频/语音/文件，`localPath` 不指向媒体文件时只显示占位文字。
   - `archive/<对话 id>.jsonl`：归档的旧对话
 
 构件自己的数据库只存两样（存在构件的 `app.db` 里，由 drizzle 迁移生成，**不入库**）：
@@ -56,10 +57,12 @@ viewer/
 ├── server/                 # 后端（server actions + 特权函数）
 │   ├── tsconfig.json
 │   ├── src/
-│   │   ├── actions.ts      # 四个 action：getOverview / getMessages /
+│   │   ├── actions.ts      # 五个 action：getOverview / getMessages / getMedia /
 │   │   │                   # markConversationSeen / setRemark
 │   │   ├── schema.ts       # drizzle 表定义（bot_remarks、seen_positions）
-│   │   └── privileged.ts   # 读 bindings.json 与 history 文件的特权函数
+│   │   └── privileged.ts   # 读 bindings.json 与 history 文件的特权函数，
+│   │                       # 外加 getMediaFile（按 localPath 读媒体文件，
+│   │                       # 只认 ~/workspace/wechat-media/ 下面、≤50MB 的）
 │   └── .generated/
 │       └── privileged.contract.ts  # 由构建从 privileged.ts 生成的契约，不要手改
 └── drizzle/                # 数据库迁移（按顺序执行）
@@ -87,10 +90,10 @@ viewer/
    > 请帮我建一个网页构件（全栈），名字叫「微信机器人会话查看」，放在侧边栏。它用来查看我微信机器人的对话历史：数据全部读本地文件——绑定信息在 `~/workspace/skills/wechat-bot/state/bindings.json`，对话历史在 `~/hooks/state/wechat-convs/<sha>/`（`sha` 是 `sha256(机器人 id:绑定微信地址)` 前 16 位），不要把聊天记录拷进构件自己的数据库。界面三层：机器人列表 → 对话列表 → 聊天；每 8 秒自动同步一次，另有手动同步按钮；搜索只搜当前打开的对话；能给机器人加备注；有未读角标，点开对话定位到第一条未读，上方显示「以下为新消息」分隔线；滑到底标为已读。头像不用真照片，用文字色块区分两边。参考实现在 `muse-wxbot/viewer/`，按里面的文件布局和数据约定做。
 
 2. 把 `viewer/` 交给你的 Muse 当参考实现：重点是这几处——
-   - `server/src/privileged.ts`：两个特权函数 `listBotsAndConversations` 与 `getConversationMessages`，以及 `BINDINGS_PATH` 与 `CONVS_ROOT` 两个路径常量；
-   - `server/src/actions.ts`：四个 action（`getOverview` / `getMessages` / `markConversationSeen` / `setRemark`）；
+   - `server/src/privileged.ts`：三个特权函数 `listBotsAndConversations`、`getConversationMessages` 与 `getMediaFile`，以及 `BINDINGS_PATH`、`CONVS_ROOT`、`MEDIA_ROOT` 三个路径常量；
+   - `server/src/actions.ts`：五个 action（`getOverview` / `getMessages` / `getMedia` / `markConversationSeen` / `setRemark`）；
    - `server/src/schema.ts` 与 `drizzle/0001–0003`：构件自己数据库的两张表；
-   - `client/src/App.tsx`：全部界面与未读定位逻辑（轮询间隔 `POLL_MS` = 8000 毫秒）。
+   - `client/src/App.tsx`：全部界面与未读定位逻辑（轮询间隔 `POLL_MS` = 8000 毫秒），以及媒体渲染（`MediaAttachment`：图片 `<img>`、视频 `<video controls>`、语音播放条、文件点击下载）。
 
 3. 关键配置点：
    - `privileged.ts` 里的 `BINDINGS_PATH` 与 `CONVS_ROOT` 指向上面「它读什么」里的两个位置。如果你的 Muse 里技能目录或 hook 状态目录位置不同，只改这两个常量，不要硬编码任何真实 bot id。
@@ -108,6 +111,7 @@ viewer/
 - 搜索只搜当前对话，高亮、能逐条跳。
 - 给机器人改备注后，刷新还在。
 - 有未读时点开对话会定位到第一条未读；滑到底后未读清零。
+- 带媒体的消息能显示出来：图片直接看得到，视频有播放器能播，语音有转码时能点播（历史行要有 `media` 字段、文件要在 `~/workspace/wechat-media/` 里）。
 - 新绑定的机器人不用改代码，会自动出现在列表里（因为每次都实时读 `bindings.json`，没有硬编码的 bot id）。
 
 ## 安全说明

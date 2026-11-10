@@ -14,9 +14,9 @@
 // the handlers below build fresh objects with only display-safe fields.
 
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { extname, join, resolve, sep } from "node:path";
 import {
 definePrivilegedContracts,
 definePrivilegedHandlers,
@@ -31,10 +31,19 @@ const conversationSchema = z.object({
   messageCount: z.number(),
 });
 
+const mediaItemSchema = z.object({
+  kind: z.string(),
+  localPath: z.string(),
+});
+
 const messageSchema = z.object({
   ts: z.string(),
   role: z.string(),
   text: z.string(),
+  // Optional media attachments, recorded by the hook when a message
+  // carries media with a localPath: [{kind, localPath}]. The viewer renders
+  // them (image/video/voice/file) next to the message text.
+  media: z.array(mediaItemSchema).optional(),
 });
 
 export const WechatPrivileged = definePrivilegedContracts({
@@ -76,8 +85,23 @@ export const WechatPrivileged = definePrivilegedContracts({
           ts: z.string(),
           role: z.string(),
           text: z.string(),
+          media: z.array(mediaItemSchema).optional(),
         }),
       ),
+    }),
+  },
+  // Serves one media file (image/video/voice/file) from the bot's media
+  // folder so the viewer can display it. Only files under
+  // ~/workspace/wechat-media/ are ever served; anything else is refused.
+  getMediaFile: {
+    request: z.object({
+      localPath: z.string(),
+    }),
+    response: z.object({
+      found: z.boolean(),
+      mime: z.string(),
+      base64: z.string(),
+      size: z.number(),
     }),
   },
 });
@@ -91,6 +115,37 @@ const BINDINGS_PATH = join(
   "bindings.json",
 );
 const CONVS_ROOT = join(homedir(), "hooks", "state", "wechat-convs");
+
+// Media attachments downloaded by the hook live here. getMediaFile only
+// ever serves files under this root (see the path check there).
+const MEDIA_ROOT = join(homedir(), "workspace", "wechat-media");
+const MAX_MEDIA_BYTES = 50 * 1024 * 1024;
+
+function mimeForPath(path: string): string {
+  switch (extname(path).toLowerCase()) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".mp4":
+      return "video/mp4";
+    case ".mov":
+      return "video/quicktime";
+    case ".webm":
+      return "video/webm";
+    case ".mp3":
+      return "audio/mpeg";
+    case ".silk":
+      return "audio/silk";
+    default:
+      return "application/octet-stream";
+  }
+}
 
 interface Binding {
   id: string;
@@ -196,10 +251,26 @@ async function readMeta(
   return { conversations, currentId: asString(rec.current_id) };
 }
 
-function countLines(text: string): number {
+// Counts messages exactly the way getConversationMessages parses them:
+// a line counts only when it is valid JSON whose role is user/assistant.
+// (Counting raw non-empty lines instead would drift from the transcript
+// whenever a half-written or foreign line lands in the file, and the
+// unread count built on top of it could never reach zero.)
+function countMessages(text: string): number {
   let n = 0;
   for (const line of text.split("\n")) {
-    if (line.trim()) n++;
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const rec = asRecord(parsed);
+    if (!rec) continue;
+    const role = asString(rec.role);
+    if (role === "user" || role === "assistant") n++;
   }
   return n;
 }
@@ -240,7 +311,7 @@ export const WechatPrivilegedHandlers = definePrivilegedHandlers(
               label: c.label,
               createdAt: c.createdAt,
               status: c.status,
-              messageCount: content === null ? 0 : countLines(content),
+              messageCount: content === null ? 0 : countMessages(content),
             });
           }
         }
@@ -287,13 +358,68 @@ export const WechatPrivilegedHandlers = definePrivilegedHandlers(
         if (!rec) continue;
         const role = asString(rec.role);
         if (role !== "user" && role !== "assistant") continue;
+        // Optional media attachments: [{kind, localPath}]. Only keep items
+        // that actually name a kind and a path; anything malformed is
+        // dropped rather than breaking the whole transcript.
+        let media: Array<{ kind: string; localPath: string }> | undefined;
+        if (Array.isArray(rec.media)) {
+          const items: Array<{ kind: string; localPath: string }> = [];
+          for (const item of rec.media) {
+            const m = asRecord(item);
+            if (!m) continue;
+            const kind = asString(m.kind);
+            const localPath = asString(m.localPath);
+            if (!kind || !localPath) continue;
+            items.push({ kind, localPath });
+          }
+          if (items.length > 0) media = items;
+        }
         messages.push({
           ts: asString(rec.ts),
           role,
           text: asString(rec.text),
+          ...(media ? { media } : {}),
         });
       }
       return { found: true, messages };
+    },
+
+    async getMediaFile(args) {
+      // Resolve the path and require it to stay under the media root, so a
+      // crafted localPath can never read an arbitrary file on the host.
+      const resolved = resolve(args.localPath);
+      if (resolved !== MEDIA_ROOT && !resolved.startsWith(MEDIA_ROOT + sep)) {
+        return { found: false, mime: "", base64: "", size: 0 };
+      }
+      // Voice arrives as .silk, which no browser can play; when a
+      // same-name .mp3 transcode sits next to it, serve that instead.
+      let target = resolved;
+      if (resolved.toLowerCase().endsWith(".silk")) {
+        const mp3 = `${resolved.slice(0, resolved.length - ".silk".length)}.mp3`;
+        const mp3Stat = await stat(mp3).catch(() => null);
+        if (mp3Stat?.isFile()) target = mp3;
+      }
+      // Stat first: an oversized file is refused before a single byte of
+      // it is read into memory.
+      const st = await stat(target).catch(() => null);
+      if (!st?.isFile()) {
+        return { found: false, mime: "", base64: "", size: 0 };
+      }
+      if (st.size > MAX_MEDIA_BYTES) {
+        return { found: false, mime: "", base64: "", size: st.size };
+      }
+      let buf: Buffer;
+      try {
+        buf = await readFile(target);
+      } catch {
+        return { found: false, mime: "", base64: "", size: 0 };
+      }
+      return {
+        found: true,
+        mime: mimeForPath(target),
+        base64: buf.toString("base64"),
+        size: buf.length,
+      };
     },
   },
 );

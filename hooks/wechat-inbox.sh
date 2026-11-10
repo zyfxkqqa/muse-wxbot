@@ -6,9 +6,9 @@
 # (poll --bot <sel> only, state files namespaced by <sel>). When unset: legacy
 # all-bots mode (poll-all).
 # Single-bot mode is the current architecture: each WeChat window (bot) gets
-# its own hook, whose worker summaries are delivered to that window's own
-# mirror side chat (hook delivery is a single fixed target, so per-window
-# mirrors require per-window hooks).
+# its own hook, whose worker is delivered to that window's own work chat
+# (hook delivery is a single fixed target, so per-window delivery requires
+# per-window hooks).
 #
 # Ordering: each CONVERSATION (bot + user) is handled by at most ONE worker at
 # a time (per-conversation lock file). Different conversations get their own
@@ -83,6 +83,123 @@ pending_count() {
   fi
 }
 
+media_ext() {
+  case "$1" in
+    image) echo jpg ;;
+    voice) echo silk ;;
+    video) echo mp4 ;;
+    *) echo dat ;;
+  esac
+}
+
+# Download one media file with retries. The file lands under a temp name
+# first and is renamed only on success, so a half-written file can never
+# pose as a completed download. An already-present final file counts as
+# done (deterministic names make re-runs idempotent).
+SILK_DECODER="${WECHAT_SILK_DECODER:-$HOME/workspace/tools/silk-v3-decoder/silk/decoder}"
+
+# WeChat voice (.silk) cannot play in a browser; transcode a sibling .mp3
+# next to it so the conversation viewer can offer a playable voice bar.
+# Best effort only: any failure leaves the .silk as-is and changes nothing.
+transcode_voice() {
+  local silk="$1" mp3="${1%.silk}.mp3" pcm
+  [ -s "$mp3" ] && return 0
+  [ -x "$SILK_DECODER" ] || return 1
+  pcm="$(mktemp)"
+  if "$SILK_DECODER" "$silk" "$pcm" >/dev/null 2>&1 && [ -s "$pcm" ]; then
+    if ffmpeg -y -v error -f s16le -ar 24000 -ac 1 -i "$pcm" -codec:a libmp3lame -q:a 4 -f mp3 "$mp3.tmp" >/dev/null 2>&1 && [ -s "$mp3.tmp" ]; then
+      mv "$mp3.tmp" "$mp3"
+      rm -f "$pcm"
+      log "wechat: voice transcoded $mp3"
+      return 0
+    fi
+  fi
+  rm -f "$pcm" "$mp3.tmp"
+  return 1
+}
+
+try_download() {
+  local aes="$1" furl="$2" eparam="$3" out="$4" attempts="$5"
+  if [ -s "$out" ]; then
+    case "$out" in *.silk) transcode_voice "$out" || true ;; esac
+    return 0
+  fi
+  local tmp="${out}.part" attempt
+  rm -f "$tmp"
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if [ -n "$furl" ]; then
+      $CLI download-media --aes-key "$aes" --full-url "$furl" --out "$tmp" >/dev/null 2>&1
+    elif [ -n "$eparam" ]; then
+      $CLI download-media --aes-key "$aes" --enc-param "$eparam" --out "$tmp" >/dev/null 2>&1
+    else
+      rm -f "$tmp"
+      return 1
+    fi
+    if [ -s "$tmp" ]; then
+      mv "$tmp" "$out"
+      case "$out" in *.silk) transcode_voice "$out" || true ;; esac
+      return 0
+    fi
+    if [ "$attempt" -lt "$attempts" ]; then sleep 10; fi
+  done
+  rm -f "$tmp"
+  return 1
+}
+
+# Intake media pass (hybrid download, step 2): the messages are already in
+# the pending buffer (buffer first, nothing can be lost from here on). Try
+# to fetch this run's new media right away with short patience; successes
+# get their localPath written back into the buffered records. A failure is
+# NOT final: the wake pass retries with full patience, and the worker has
+# its own fallback after that.
+intake_download() {
+  local src="$1"
+  local ok_list mid tmp_p
+  ok_list="$(mktemp)"
+  MEDIA_DIR="$HOME/workspace/wechat-media/$(date +%Y-%m-%d)"
+  mkdir -p "$MEDIA_DIR"
+  jq -c 'select(.media) | {messageId, media}' "$src" 2>/dev/null | while read -r line; do
+    mid="$(echo "$line" | jq -r '.messageId')"
+    echo "$line" | jq -c '.media | to_entries[] | {idx: .key, m: .value}' | while read -r e; do
+      local idx kind aes furl eparam out
+      idx="$(echo "$e" | jq -r '.idx')"
+      kind="$(echo "$e" | jq -r '.m.kind')"
+      aes="$(echo "$e" | jq -r '.m.aesKey // empty')"
+      furl="$(echo "$e" | jq -r '.m.fullUrl // empty')"
+      eparam="$(echo "$e" | jq -r '.m.encryptedQueryParam // empty')"
+      [ -n "$aes" ] || continue
+      out="$MEDIA_DIR/${mid}_${idx}.$(media_ext "$kind")"
+      if try_download "$aes" "$furl" "$eparam" "$out" 3; then
+        log "wechat: media downloaded (intake) $out"
+        echo "${mid}_${idx}" >> "$ok_list"
+      else
+        log "wechat: media intake deferred mid=$mid idx=$idx kind=$kind"
+      fi
+    done
+  done
+  if [ -s "$ok_list" ] && [ -f "$PENDING_FILE" ]; then
+    tmp_p="$(mktemp)"
+    if jq -s -c --arg mdir "$MEDIA_DIR" --slurpfile ok <(jq -R -s 'split("\n")|map(select(length>0))' "$ok_list") '
+      .[] | .messageId as $mid |
+      if .media then
+        .media = (.media | to_entries | map(
+          .key as $i | .value as $m |
+          if (($ok[0] | index("\($mid)_\($i)")) and ($m.localPath == null))
+          then $m + { localPath: "\($mdir)/\($mid)_\($i).\(if $m.kind == "image" then "jpg" elif $m.kind == "voice" then "silk" elif $m.kind == "video" then "mp4" else "dat" end)" }
+          else $m
+          end
+        ))
+      else .
+      end
+    ' "$PENDING_FILE" > "$tmp_p" 2>/dev/null; then
+      mv "$tmp_p" "$PENDING_FILE"
+    else
+      rm -f "$tmp_p"
+    fi
+  fi
+  rm -f "$ok_list"
+}
+
 # Wake ONE worker for the oldest-waiting conversation whose lock is free.
 # Extracts that conversation's messages (chronological by seq) from the
 # pending buffer, takes its lock, and wakes.
@@ -137,12 +254,16 @@ wake_one_for_pending() {
         if ($media | length) == 0 then $msg
         else
           ($media | to_entries | map(
+            select(.value.localPath == null) |
             .key as $idx |
             .value as $m |
-            # 这里只标记，实际下载由下面的shell循环做
+            # 这里只标记还没下好的（入队时下成功的带 localPath，跳过），
+            # 实际下载由下面的shell循环做
             $m + { _idx: $idx }
           )) as $marked |
-          $msg + { _media_to_dl: $marked }
+          if ($marked | length) == 0 then $msg
+          else $msg + { _media_to_dl: $marked }
+          end
         end
       )
     ')"
@@ -157,28 +278,16 @@ wake_one_for_pending() {
         eparam="$(echo "$m" | jq -r '.encryptedQueryParam // empty')"
         idx="$(echo "$m" | jq -r '._idx')"
         [ -n "$aes" ] || continue
-        ext="bin"
-        case "$kind" in
-          image) ext="jpg" ;;
-          voice) ext="silk" ;;
-          video) ext="mp4" ;;
-          file) ext="dat" ;;
-        esac
+        ext="$(media_ext "$kind")"
         out="$MEDIA_DIR/${mid}_${idx}.${ext}"
         # 下载带重试：消息通知到达时 CDN 上的文件可能还没就绪，单次失败不代表真失败
         # （实测 12:28 那次 3 次×5 秒都不够，CDN 经常要几十秒才就绪）
+        # 这里只下入队时没下成的，用足耐心 6 次×10 秒；try_download 经临时名
+        # 落盘、成功才改正式名，防半截文件冒充成功。
         dl_ok=""
-        for attempt in 1 2 3 4 5 6; do
-          if [ -n "$furl" ]; then
-            $CLI download-media --aes-key "$aes" --full-url "$furl" --out "$out" >/dev/null 2>&1
-          elif [ -n "$eparam" ]; then
-            $CLI download-media --aes-key "$aes" --enc-param "$eparam" --out "$out" >/dev/null 2>&1
-          else
-            break
-          fi
-          if [ -f "$out" ]; then dl_ok="1"; break; fi
-          sleep 10
-        done
+        if try_download "$aes" "$furl" "$eparam" "$out" 6; then
+          dl_ok="1"
+        fi
         if [ -n "$dl_ok" ]; then
           log "wechat: media downloaded $out"
           echo "${mid}_${idx}" >> "$DL_OK_LIST"
@@ -322,6 +431,9 @@ if [ "$COUNT" -gt 0 ]; then
     fi
     rm -f "$STATE_DIR/roster.new" "$ROSTER_FILE.tmp"
   ) 200>"$ROSTER_LOCK"
+  # 结合版第二步：消息已落盘（底账先行），紧接着试下这一批的媒体；
+  # 下好的把 localPath 回写进缓冲记录，下不成的留给唤醒时足耐心再下。
+  intake_download "$MESSAGES_FILE"
   rm -f "$MESSAGES_FILE"
   # Transition: an old-style (global-lock) worker may still be running; let it
   # finish its batch before the per-conversation scheme takes over.

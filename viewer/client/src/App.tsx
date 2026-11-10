@@ -45,6 +45,7 @@ const PATHS = {
   x: "M18 6 6 18M6 6l12 12",
   check: "M20 6 9 17l-5-5",
   message: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
+  play: "M6 4l14 8-14 8V4Z",
 };
 
 /* ---------- avatars ---------- */
@@ -210,6 +211,168 @@ function HighlightedText({
         ),
       )}
     </>
+  );
+}
+
+/* ---------- media attachments ---------- */
+
+type MediaItem = { kind: string; localPath: string };
+type ChatMessage = MessagesData["messages"][number];
+
+/* A message that carries attachments has no separate visible text when
+ * its text is only the "[图片]"/"[视频]" placeholder the history format
+ * stores for pure media messages — the attachment replaces it. Search
+ * uses the same predicate (visibleTextOf), so a hidden placeholder can
+ * never be counted as a hit the user cannot see. */
+function hidesPlaceholderText(m: ChatMessage): boolean {
+  if (!m.media || m.media.length === 0) return false;
+  const t = m.text.trim();
+  return t === "[图片]" || t === "[视频]";
+}
+
+function visibleTextOf(m: ChatMessage): string {
+  return hidesPlaceholderText(m) ? "" : m.text;
+}
+
+/* Blob URLs for fetched media, keyed by localPath. The chat polls every
+ * 8s and re-renders, so without this cache every poll would re-fetch (and
+ * re-decode) every image/video. Blob URLs live until the page is closed;
+ * the viewer only ever holds a handful of media files at once. */
+const mediaObjectUrls = new Map<string, string>();
+
+function base64ToObjectUrl(base64: string, mime: string): string {
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return URL.createObjectURL(
+    new Blob([bytes], { type: mime || "application/octet-stream" }),
+  );
+}
+
+function fileNameOf(path: string): string {
+  const idx = path.lastIndexOf("/");
+  return idx >= 0 ? path.slice(idx + 1) : path;
+}
+
+/** Fetches one media file (when enabled) and memoizes its Blob URL. */
+function useMediaUrl(localPath: string, enabled: boolean) {
+  const q = useQuery({
+    queryKey: ["media", localPath],
+    queryFn: () => api.getMedia({ localPath }),
+    staleTime: Infinity,
+    retry: false,
+    enabled,
+  });
+  const data = q.data;
+  const url = useMemo(() => {
+    if (!data?.found || !data.base64) return null;
+    const cached = mediaObjectUrls.get(localPath);
+    if (cached) return cached;
+    const created = base64ToObjectUrl(data.base64, data.mime);
+    mediaObjectUrls.set(localPath, created);
+    return created;
+  }, [data, localPath]);
+  return { q, data, url };
+}
+
+/**
+ * Renders one media attachment from a history line's media field.
+ * Images show inline, videos get a player. Voice arrives as .silk, which
+ * no browser can play: the server swaps in a same-name .mp3 transcode
+ * when one exists, and only then does this render a real audio player —
+ * otherwise it falls back to a voice chip (the transcript is in the
+ * message text). Files are fetched only after the user clicks: the click
+ * starts the fetch and the download follows as soon as the data arrives.
+ */
+function MediaAttachment({ media }: { media: MediaItem }) {
+  const isFile = media.kind === "file";
+  const [wanted, setWanted] = useState(false);
+  const { q, data, url } = useMediaUrl(media.localPath, !isFile || wanted);
+  const downloadStarted = useRef(false);
+
+  useEffect(() => {
+    if (!isFile || !wanted || !url || downloadStarted.current) return;
+    downloadStarted.current = true;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileNameOf(media.localPath);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }, [isFile, wanted, url, media.localPath]);
+
+  const kindLabel =
+    media.kind === "image"
+      ? "图片"
+      : media.kind === "video"
+        ? "视频"
+        : media.kind === "voice"
+          ? "语音"
+          : "文件";
+
+  if (isFile && !wanted) {
+    return (
+      <button
+        type="button"
+        onClick={() => setWanted(true)}
+        className="mt-1.5 inline-block text-xs underline opacity-80"
+      >
+        下载 {fileNameOf(media.localPath)}
+      </button>
+    );
+  }
+  if (q.isPending) {
+    return <p className="mt-1.5 text-xs opacity-70">正在加载{kindLabel}…</p>;
+  }
+  if (q.isError || !data?.found || !url) {
+    return <p className="mt-1.5 text-xs opacity-70">（{kindLabel}未能加载）</p>;
+  }
+  if (media.kind === "image") {
+    return (
+      <img
+        src={url}
+        alt="图片"
+        className="mt-1.5 max-h-72 w-auto max-w-full rounded-lg object-contain"
+      />
+    );
+  }
+  if (media.kind === "video") {
+    return (
+      <video
+        src={url}
+        controls
+        preload="metadata"
+        playsInline
+        className="mt-1.5 max-h-72 w-full max-w-full rounded-lg bg-black"
+      />
+    );
+  }
+  if (media.kind === "voice") {
+    if (data.mime.startsWith("audio/") && data.mime !== "audio/silk") {
+      return (
+        <audio
+          controls
+          preload="metadata"
+          src={url}
+          className="mt-1.5 w-full max-w-[260px]"
+        />
+      );
+    }
+    return (
+      <span className="mt-1.5 flex items-center gap-1.5 text-xs opacity-80">
+        <Icon d={PATHS.play} className="h-3.5 w-3.5" />
+        语音消息（转写见文字）
+      </span>
+    );
+  }
+  return (
+    <a
+      href={url}
+      download={fileNameOf(media.localPath)}
+      className="mt-1.5 inline-block text-xs underline opacity-80"
+    >
+      下载 {fileNameOf(media.localPath)}
+    </a>
   );
 }
 
@@ -446,8 +609,12 @@ export function App() {
   }
 
   /* While the user sits at the bottom of the open chat, anything that
-   * arrives is on screen — count it as seen so the badges keep up. */
+   * arrives is on screen — count it as seen so the badges keep up.
+   * Paused while a resume jump is still armed: marking everything seen
+   * before the jump lands would wipe the unread divider, the "N 条新消息"
+   * button and the badges before the user has seen any of it. */
   useEffect(() => {
+    if (resumeArmedRef.current) return;
     if (inChat && pinnedToBottom.current && msgs.length > 0) {
       markSeenThrough(msgs.length);
     }
@@ -459,8 +626,11 @@ export function App() {
    * to the first new message instead of the newest one. */
   useEffect(() => {
     if (!inChat || !resumeArmedRef.current || msgs.length === 0) return;
-    resumeArmedRef.current = false;
+    // Stay armed until the resume point actually exists in the loaded
+    // messages; disarming earlier would hand control back to the
+    // mark-all-seen effect above with nothing landed yet.
     if (resumeIndex < 0 || resumeIndex >= msgs.length) return;
+    resumeArmedRef.current = false;
     pinnedToBottom.current = false;
     requestAnimationFrame(() => {
       msgRefs.current
@@ -478,7 +648,11 @@ export function App() {
     const q = query.toLowerCase();
     const out: number[] = [];
     msgs.forEach((m, i) => {
-      if (m.text.toLowerCase().includes(q)) out.push(i);
+      // Same visible-text predicate as the rendering: a placeholder the
+      // bubble hides ("[图片]"/"[视频]" on a message with attachments)
+      // must not count as a hit — the user could never see it.
+      const visible = visibleTextOf(m);
+      if (visible && visible.toLowerCase().includes(q)) out.push(i);
     });
     return out;
   }, [msgs, query]);
@@ -646,7 +820,10 @@ export function App() {
                           </span>
                           <StatusDot bot={b} />
                         </span>
-                        <span className="mt-0.5 block truncate text-xs text-[var(--dim)]">
+                        <span
+                          className="mt-0.5 block break-all text-xs text-[var(--dim)] sm:truncate"
+                          title={`${b.displayName}${b.platformBotId ? ` · ${b.platformBotId}` : ""}${b.remark && b.remark !== b.label ? ` · 原名 ${b.label}` : ""}`}
+                        >
                           {b.displayName}
                           {b.platformBotId ? ` · ${b.platformBotId}` : ""}
                           {b.remark && b.remark !== b.label
@@ -715,7 +892,10 @@ export function App() {
                   </h1>
                   <StatusDot bot={bot} />
                 </div>
-                <p className="mt-0.5 truncate text-xs text-[var(--dim)]">
+                <p
+                  className="mt-0.5 break-all text-xs text-[var(--dim)] sm:truncate"
+                  title={`${bot.displayName}${bot.platformBotId ? ` · ${bot.platformBotId}` : ""}${bot.remark && bot.remark !== bot.label ? ` · 原名 ${bot.label}` : ""}`}
+                >
                   {bot.displayName}
                   {bot.platformBotId ? ` · ${bot.platformBotId}` : ""}
                   {bot.remark && bot.remark !== bot.label
@@ -998,11 +1178,19 @@ export function App() {
                           : "rounded-lg rounded-tl-sm bg-[var(--surface)] text-[var(--text)]"
                       } ${isActive ? "ring-2 ring-amber-400 ring-offset-1" : ""}`}
                     >
-                      <HighlightedText
-                        text={m.text}
-                        query={query}
-                        isActiveMatch={isActive}
-                      />
+                      {hidesPlaceholderText(m) ? null : (
+                        <HighlightedText
+                          text={m.text}
+                          query={query}
+                          isActiveMatch={isActive}
+                        />
+                      )}
+                      {m.media?.map((item, k) => (
+                        <MediaAttachment
+                          key={`${item.localPath}-${k}`}
+                          media={item}
+                        />
+                      ))}
                     </div>
                   </div>
                 </div>
