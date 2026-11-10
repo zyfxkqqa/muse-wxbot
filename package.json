@@ -1,0 +1,1 @@
+{"bin":{"wechat-bot":"dist/cli.js"},"dependencies":{},"devDependencies":{"@types/node":"^24.8.1","typescript":"^5.9.3"},"name":"wechat-bot","private":true,"scripts":{"build":"tsc -p tsconfig.json","typecheck":"tsc -p tsconfig.json --noEmit"},"type":"module","version":"0.1.0"}

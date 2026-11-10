@@ -1,0 +1,74 @@
+/* Web-font slot: uncomment the line below and put your font there. A web-font
+   @import must come before the Tailwind import — an @import placed after any
+   other rule is a build error, and it is reported against a line number in the
+   expanded Tailwind output, far past the end of this file, so the message
+   cannot point you at the mistake. */
+/* @import url('https://fonts.googleapis.com/css2?family=Your+Font:wght@400..700&display=swap'); */
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-lg: 18px;
+  --text-lg--line-height: 28px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 32px;
+  --text-3xl: 30px;
+  --text-3xl--line-height: 36px;
+  --text-4xl: 36px;
+  --text-4xl--line-height: 40px;
+  --text-5xl: 48px;
+  --text-5xl--line-height: 52px;
+}
+
+:root {
+  color-scheme: light dark;
+  --bg: #ededed;
+  --surface: #ffffff;
+  --text: #1a1a1a;
+  --dim: #8a8a8a;
+  --border: #d9d9d9;
+  --accent: #07c160;
+  --current-bg: #e7f0fe;
+  --current-text: #1a56c4;
+  --unread: #fa5151;
+  --radius: 12px;
+  --bubble-user: #95ec69;
+  --bubble-user-text: #1a1a1a;
+  --chip: #f7f7f7;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #191919;
+    --surface: #2c2c2c;
+    --text: #f0f0f0;
+    --dim: #9a9a9a;
+    --border: #3a3a3a;
+    --accent: #07c160;
+    --current-bg: #1d3355;
+    --current-text: #8db4f2;
+    --unread: #fa5151;
+    --bubble-user: #2c7a3f;
+    --bubble-user-text: #f2f2f2;
+    --chip: #242424;
+  }
+}
+
+body {
+  font-family:
+    -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    system-ui, sans-serif;
+}
