@@ -1,6 +1,14 @@
+# 构建产物与依赖（本地生成，不入库）
 node_modules/
 dist/
+
+# 本地私有状态：绑定凭证、发送记录、会话历史（绝不入库）
 state/
+*.local.json
+
+# 日志与临时文件
 *.log
+.DS_Store
+
+# 查看器本地数据库（只存备注与已读条数，不入库）
 app.db
-.space-build/
