@@ -21,7 +21,8 @@ set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
 DRY="${HATCH_HOOK_DRY_RUN:-0}"
-CLI="node /home/hatch/workspace/skills/wechat-bot/dist/cli.js"
+SKILL_DIR="${WECHAT_BOT_SKILL_DIR:-$HOME/workspace/skills/wechat-bot}"
+CLI="node $SKILL_DIR/dist/cli.js"
 STATE_DIR="$HOME/hooks/state"
 LOCK_FILE="$STATE_DIR/wechat-inbox.lock"
 NOTIFY_PREFIX="$STATE_DIR/wechat-inbox.notifystart"
@@ -38,40 +39,6 @@ NS="${BOT_SEL:-all}"
 PENDING_FILE="$STATE_DIR/wechat-inbox.pending.$NS.jsonl"
 
 mkdir -p "$STATE_DIR"
-
-# 消息状态机：queued -> processing -> replied -> mirrored
-# 超时300秒未完成的processing，重入队（最多3次），超限进死信
-DEAD_LETTER="$STATE_DIR/wechat-dead-letter.jsonl"
-MAX_RETRY=3
-
-# 检查超时的processing消息，重入队或进死信
-requeue_timed_out() {
-  [ -s "$PENDING_FILE" ] || return 0
-  local now tmpfile
-  now=$(date +%s)
-  tmpfile="$PENDING_FILE.tmp"
-  jq -c --argjson now "$now" --argjson ttl "$WORKER_TTL" --argjson maxr "$MAX_RETRY" '
-    . as $msg |
-    if ($msg._state == "processing" and ($now - ($msg._processing_since // 0)) > $ttl) then
-      ($msg._retry // 0) as $r |
-      if $r >= $maxr then
-        # 进死信（由shell写文件，这里标记）
-        $msg + {_dead: true}
-      else
-        # 重入队
-        $msg + {_state: "queued", _retry: ($r + 1)} | del(._processing_since)
-      end
-    else .
-    end
-  ' "$PENDING_FILE" 2>/dev/null > "$tmpfile" || return 0
-  # 把死信写出去
-  jq -c 'select(._dead)' "$tmpfile" 2>/dev/null | while read -r dl; do
-    echo "$dl" | jq -c '{ts: now, message: del(._dead, ._state, ._retry, ._processing_since)}' >> "$DEAD_LETTER"
-  done
-  # 过滤掉死信，写回
-  jq -c 'select(._dead | not)' "$tmpfile" 2>/dev/null > "$PENDING_FILE" || true
-  rm -f "$tmpfile"
-}
 
 # Single instance: skip if a previous poll is still running.
 exec 9>"$LOCK_FILE"
@@ -203,9 +170,9 @@ wake_one_for_pending() {
         dl_ok=""
         for attempt in 1 2 3 4 5 6; do
           if [ -n "$furl" ]; then
-            "$CLI" download-media --aes-key "$aes" --full-url "$furl" --out "$out" >/dev/null 2>&1
+            $CLI download-media --aes-key "$aes" --full-url "$furl" --out "$out" >/dev/null 2>&1
           elif [ -n "$eparam" ]; then
-            "$CLI" download-media --aes-key "$aes" --enc-param "$eparam" --out "$out" >/dev/null 2>&1
+            $CLI download-media --aes-key "$aes" --enc-param "$eparam" --out "$out" >/dev/null 2>&1
           else
             break
           fi
@@ -246,8 +213,6 @@ wake_one_for_pending() {
 }
 
 # Bot list as "<id>\t<label>" lines (filtered to our bot in single-bot mode).
-# 每轮先检查超时的processing消息
-requeue_timed_out
 if [ -n "$BOT_SEL" ]; then
   BOTS="$($CLI status 2>/dev/null | jq -r --arg sel "$BOT_SEL" \
     '.bots[]? | select(.id | startswith($sel)) | "\(.id)\t\(.label)"')"
@@ -282,13 +247,13 @@ fi
 
 # Poll: single bot in single-bot mode, all bots in legacy mode.
 if [ -n "$BOT_SEL" ]; then
-  POLL_OUT="$($CLI poll --bot "$BOT_SEL" --timeout-ms 6000 2>/dev/null)" || {
+  POLL_OUT="$($CLI poll --bot "$BOT_SEL" --timeout-ms 7000 2>/dev/null)" || {
     log "wechat poll crashed"
     silent "poll crashed"
     exit 0
   }
 else
-  POLL_OUT="$($CLI poll-all --timeout-ms 6000 2>/dev/null)" || {
+  POLL_OUT="$($CLI poll-all --timeout-ms 7000 2>/dev/null)" || {
     log "wechat poll-all crashed"
     silent "poll-all crashed"
     exit 0
