@@ -71,23 +71,6 @@ async function selectBot(store: FsWechatBotStore): Promise<WechatBotBinding> {
   return found;
 }
 
-// Binding greeting: sent automatically by the program itself right after a
-// new bot is bound, to the account that just bound it (bot.ownerExternalId).
-// Keep this text in sync with the greeting in hooks/worker-prompt.md.
-const BINDING_GREETING = [
-  "你好呀，我是 Muse，用户的个人助理，你说的事我会记在当前对话里，不用重复说。",
-  "我能帮你：",
-  "聊天、回答问题",
-  "写东西、改文字、翻译",
-  "总结归纳、出主意、做计划",
-  "操作：",
-  "帮助 — 看指令清单",
-  "新建对话 — 开始一个新对话，之前的就不记得了",
-  "切换对话 — 看你的对话清单，切回以前的对话",
-  "修改旁聊名称 新名字 — 给当前对话改名",
-  "直接发消息就能聊。"
-].join("\n");
-
 async function cmdProvision() {
   const store = new FsWechatBotStore(bindingFile);
   const api = new WechatClawbotApi();
@@ -111,53 +94,12 @@ async function cmdProvision() {
     await store.save(bot);
   }
   await chmod(bindingFile, 0o600).catch(() => undefined);
-  // Binding greeting: the program itself sends the intro to the bound account
-  // 5s after binding succeeds — no manual step, no waiting for the bound
-  // account to message first. Best-effort: a failed greeting is reported but
-  // never fails the binding.
-  try {
-    await api.notifyStart({ baseUrl: bot.baseUrl, token: bot.token });
-  } catch {
-    // Channel will also be brought up by the inbox hook heartbeat.
-  }
-  // Wait 5s before sending: a greeting sent 1s after binding (2026-11-10
-  // 14:23:52) was accepted by the API but never delivered, while a manual
-  // test send later the same day arrived fine. The hook's notify-start for
-  // the new bot ran 2s after that greeting, so the channel likely was not
-  // up yet. If the delayed greeting still does not arrive, the cause is
-  // the missing session, not the channel.
-  await new Promise((resolve) => setTimeout(resolve, 5000));
-  try {
-    await api.sendText({
-      baseUrl: bot.baseUrl,
-      token: bot.token,
-      toUserId: bot.ownerExternalId,
-      text: BINDING_GREETING
-    });
-    const entry = JSON.stringify({
-      ts: new Date().toISOString(),
-      botId: bot.id,
-      to: bot.ownerExternalId,
-      text: BINDING_GREETING
-    });
-    await appendFile(sentLogFile, entry + "\n", "utf8").catch(() => undefined);
-    await chmod(sentLogFile, 0o600).catch(() => undefined);
-    emit({ type: "greeting", sent: true, to: bot.ownerExternalId });
-  } catch (e) {
-    emit({
-      type: "greeting",
-      sent: false,
-      error: e instanceof Error ? e.message : String(e)
-    });
-  }
-  // The binding-time greeting above is best-effort and cannot be verified as
-  // delivered: the platform does not deliver a bot's message before the bound
-  // account has messaged it first (proven 2026-11-10 — greetings at +1s and
-  // +5s after binding, and a test send ~2min after binding, were all accepted
-  // by the API but never arrived; only sends after the user messages first
-  // arrive). So mark the intro as pending: the worker delivers it on the
-  // bound account's first message (intro first, then the reply) and clears
-  // this marker. See the hook prompt ("先判断要不要先发介绍").
+  // Mark the intro as pending instead of sending it from here: the platform
+  // does not deliver a bot's message before the bound account has messaged
+  // it first (proven 2026-11-10 - sends at +1s, +5s and ~2min after binding
+  // were all accepted by the API but never arrived). The worker delivers the
+  // intro on the bound account's first message (intro first, then the reply)
+  // and clears this marker. See the hook prompt ("先判断要不要先发介绍").
   const markerFile = join(hooksStateDir, `wechat-intro-pending.${bot.id.slice(0, 8)}`);
   await writeFile(markerFile, "", "utf8").catch(() => undefined);
   emit({ type: "confirmed", botId: bot.id, botLabel: botLabel(bot), displayName: bot.displayName });
