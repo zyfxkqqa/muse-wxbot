@@ -96,33 +96,73 @@ function parseTs(ts: string): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+/* All displayed times are pinned to Beijing time (Asia/Shanghai):
+   WeChat is a Chinese app, so the viewer never follows the opening
+   device's timezone. Stored timestamps are absolute instants; only
+   the formatting is pinned here. */
+const beijingPartsFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: "Asia/Shanghai",
+  hourCycle: "h23",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+});
+
+interface BeijingTime {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+}
+
+function beijingTime(d: Date): BeijingTime {
+  const parts = beijingPartsFmt.formatToParts(d);
+  const get = (type: string): number =>
+    Number(parts.find((part) => part.type === type)?.value ?? 0);
+  return {
+    year: get("year"),
+    month: get("month"),
+    day: get("day"),
+    hour: get("hour") % 24,
+    minute: get("minute"),
+  };
+}
+
+function beijingDaySerial(bt: BeijingTime): number {
+  return Math.round(Date.UTC(bt.year, bt.month - 1, bt.day) / 86400000);
+}
+
 function dayKey(d: Date): string {
-  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  const bt = beijingTime(d);
+  return `${bt.year}-${bt.month - 1}-${bt.day}`;
 }
 
 function dayLabel(d: Date): string {
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const that = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  const diffDays = Math.round((today.getTime() - that.getTime()) / 86400000);
-  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(
-    d.getMinutes(),
+  const bt = beijingTime(d);
+  const diffDays = beijingDaySerial(beijingTime(new Date())) - beijingDaySerial(bt);
+  const hm = `${String(bt.hour).padStart(2, "0")}:${String(
+    bt.minute,
   ).padStart(2, "0")}`;
   if (diffDays === 0) return hm;
   if (diffDays === 1) return `昨天 ${hm}`;
-  return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+  return `${bt.year}年${bt.month}月${bt.day}日 ${hm}`;
 }
 
 function clockLabel(d: Date): string {
-  return `${String(d.getHours()).padStart(2, "0")}:${String(
-    d.getMinutes(),
+  const bt = beijingTime(d);
+  return `${String(bt.hour).padStart(2, "0")}:${String(
+    bt.minute,
   ).padStart(2, "0")}`;
 }
 
 function dateLabel(ts: string): string {
   const d = parseTs(ts);
   if (!d) return "";
-  return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`;
+  const bt = beijingTime(d);
+  return `${bt.year}年${bt.month}月${bt.day}日`;
 }
 
 /* ---------- highlighted message text ---------- */
