@@ -36,7 +36,7 @@ node dist/cli.js provision
 
 让 `hooks/wechat-inbox.sh` 定时跑起来（例如每 8 秒一次），它会：
 
-1. 跑 `poll-all` 取所有机器人的新消息；
+1. 跑 `poll` 取新消息（每个机器人一个包装文件、各取各的；未分实例时才用 `poll-all`）；
 2. 有新消息就交给 worker 处理并回复；
 3. 没新消息就静默，不打扰。
 
@@ -49,14 +49,15 @@ node dist/cli.js provision
 查看器的完整源码与重建方法见 `viewer/README.md`。要点：
 
 - 先把机器人跑起来（绑定成功、轮询 hook 在跑、`bindings.json` 与 history 文件已生成），查看器才有东西可看。
-- 在自己的 Muse 里新建一个全栈网页构件，名字「微信机器人会话查看」，把 `viewer/` 当参考实现（文件布局、特权函数、四个 action、drizzle 迁移都照着做）。
+- 在自己的 Muse 里新建一个全栈网页构件，名字「微信机器人会话查看」，把 `viewer/` 当参考实现（文件布局、特权函数、五个 action、drizzle 迁移都照着做）。
 - 关键配置点只有两处：`viewer/server/src/privileged.ts` 里的 `BINDINGS_PATH` 与 `CONVS_ROOT`（指向绑定文件与历史文件夹；如果你的 Muse 里这两个位置不同，只改这两个常量，不要硬编码真实 bot id）；`viewer/client/src/App.tsx` 的 `POLL_MS`（自动同步间隔，默认 8000 毫秒）。
 - 构建与发布由 Muse 的构件工具完成；不要自己跑构建、不要手改产物。
 
 ## 状态文件位置
 
 - 绑定信息：`state/bindings.json`
-- 会话历史：`state/wechat-convs/<对话哈希>/`
+- 会话历史：`~/hooks/state/wechat-convs/<对话哈希>/`
+- 介绍待发标记：`~/hooks/state/wechat-intro-pending.<机器人 id 前 8 位>`
 - 发送记录：`state/sent-log.jsonl`
 
 这些都在 `.gitignore` 里，是本地私有数据，绝不入库。换机器部署时，只拷通用代码与文档，重新扫码绑定即可。
