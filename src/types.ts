@@ -24,6 +24,7 @@ export interface WechatMediaRef {
   aes_key?: string;
   full_url?: string;
   encrypted_query_param?: string;
+  encrypt_type?: number;
   file_name?: string;
   md5?: string;
   len?: number;
@@ -33,10 +34,39 @@ export interface WechatMediaRef {
 export interface WechatMessageItem {
   type?: number;
   text_item?: { text?: string };
-  image_item?: { media?: WechatMediaRef };
-  voice_item?: { media?: WechatMediaRef; text?: string };
-  file_item?: { media?: WechatMediaRef; file_name?: string; md5?: string; len?: number };
-  video_item?: { media?: WechatMediaRef };
+  image_item?: { media?: WechatMediaRef; mid_size?: number };
+  voice_item?: { media?: WechatMediaRef; text?: string; encode_type?: number };
+  file_item?: { media?: WechatMediaRef; file_name?: string; md5?: string; len?: string };
+  video_item?: { media?: WechatMediaRef; video_size?: number };
+}
+
+// Upload media type for getUploadUrl (proto: UploadMediaType).
+// @deprecated Unused — uploadMedia passes numeric media types directly.
+// Kept for source compatibility; the CLI/hook never reads this.
+export const UploadMediaType = {
+  IMAGE: 1,
+  VIDEO: 2,
+  FILE: 3,
+  VOICE: 4
+} as const;
+
+/** @deprecated Unused — getUploadUrl takes a plain object now. */
+export interface WechatGetUploadUrlReq {
+  filekey?: string;
+  media_type?: number;
+  to_user_id?: string;
+  rawsize?: number;
+  rawfilemd5?: string;
+  filesize?: number;
+  no_need_thumb?: boolean;
+  aeskey?: string;
+}
+
+/** @deprecated Unused — getUploadUrl returns a plain object now. */
+export interface WechatGetUploadUrlResp {
+  upload_param?: string;
+  thumb_upload_param?: string;
+  upload_full_url?: string;
 }
 
 export interface WechatMessage {
@@ -79,6 +109,8 @@ export interface WechatProvisionStatus {
     | "WECHAT_WAITING_FOR_SCAN"
     | "WECHAT_SCANNED"
     | "WECHAT_CONFIRMED"
+    // @deprecated "WECHAT_FAILED" is never emitted by createBot (failures
+    // throw instead). Kept in the union for source compatibility only.
     | "WECHAT_FAILED";
   qrImageDataUrl?: string;
   qrValue?: string;

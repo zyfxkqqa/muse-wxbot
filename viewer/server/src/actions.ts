@@ -26,6 +26,7 @@ const botShape = z.object({
   label: z.string(),
   displayName: z.string(),
   platformBotId: z.string(),
+  conversationSha: z.string(),
   createdAt: z.string(),
   lastError: z.string().nullable(),
   remark: z.string(),
@@ -47,15 +48,18 @@ const messagesResponse = z.object({
       role: z.string(),
       text: z.string(),
       media: z
-        .array(
-          z.object({
-            kind: z.string(),
-            localPath: z.string(),
-          }),
-        )
+        .array(z.object({ kind: z.string(), localPath: z.string() }))
         .optional(),
     }),
   ),
+});
+
+const mediaResponse = z.object({
+  found: z.boolean(),
+  dataBase64: z.string(),
+  mimeType: z.string(),
+  size: z.number(),
+  filename: z.string(),
 });
 
 export const Actions = {
@@ -78,7 +82,39 @@ export const Actions = {
       const remarkByBot = new Map(remarkRows.map((r) => [r.botId, r.remark]));
       const seenRows = await db.select().from(schema.seenPositions);
       const seenByKey = new Map(
-        seenRows.map((r) => [`${r.botId}|${r.conversationId}`, r.seenCount]),
+        seenRows.map((r) => [`${r.botId}|${r.conversationId}`, r]),
+      );
+      // A stored seen count can exceed the live message count when the row
+      // was written against an older, longer history file (e.g. before the
+      // 2026-11-12 migration to ~/workspace/wechat-bots/). Clamping with
+      // Math.min() then marks everything as read and the unread badges
+      // never appear. Resolve such stale rows by their write time instead:
+      // messages timestamped at or before updatedAt count as seen.
+      const resolvedSeen = new Map<string, number>();
+      await Promise.all(
+        live.bots.flatMap((bot) =>
+          bot.conversations.map(async (c) => {
+            const key = `${bot.id}|${c.id}`;
+            const row = seenByKey.get(key);
+            if (!row) {
+              resolvedSeen.set(key, 0);
+            } else if (row.seenCount <= c.messageCount) {
+              resolvedSeen.set(key, row.seenCount);
+            } else {
+              const liveConv = await ctx.executePrivileged(
+                WechatPrivileged.getConversationMessages,
+                { botId: bot.id, conversationId: c.id },
+              );
+              const anchorMs = row.updatedAt.getTime();
+              resolvedSeen.set(
+                key,
+                (liveConv.messages ?? []).filter(
+                  (m) => new Date(m.ts).getTime() <= anchorMs,
+                ).length,
+              );
+            }
+          }),
+        ),
       );
       return {
         bots: live.bots.map((bot) => {
@@ -87,10 +123,7 @@ export const Actions = {
           // response.
           const { ownerExternalId: _ownerExternalId, ...botFields } = bot;
           const conversations = bot.conversations.map((c) => {
-            const seen = Math.min(
-              seenByKey.get(`${bot.id}|${c.id}`) ?? 0,
-              c.messageCount,
-            );
+            const seen = resolvedSeen.get(`${bot.id}|${c.id}`) ?? 0;
             return { ...c, unreadCount: c.messageCount - seen };
           });
           return {
@@ -128,23 +161,13 @@ export const Actions = {
 
   getMedia: defineAction({
     description:
-      "Returns one media file (image/video/voice/file) from the bot's media folder as base64, so the viewer can display it. Only files under ~/workspace/wechat-media/ are served.",
+      "Returns one media attachment (image/video/file) of a chat message as base64, read from the bot's media folder only.",
     request: z.object({
       localPath: z.string().min(1),
     }),
-    response: z.object({
-      found: z.boolean(),
-      mime: z.string(),
-      base64: z.string(),
-      size: z.number(),
-    }),
+    response: mediaResponse,
     privileged: [WechatPrivileged.getMediaFile],
-    async handler(ctx, args): Promise<{
-      found: boolean;
-      mime: string;
-      base64: string;
-      size: number;
-    }> {
+    async handler(ctx, args): Promise<z.infer<typeof mediaResponse>> {
       return ctx.executePrivileged(WechatPrivileged.getMediaFile, {
         localPath: args.localPath,
       });
@@ -228,6 +251,113 @@ export const Actions = {
       }
       ctx.invalidateQueries();
       return { ok: true as const };
+    },
+  }),
+
+  sendMessage: defineAction({
+    description:
+      "Sends one text message as the bot to the friend of the open conversation, and records it in the conversation history. The bot and target are resolved server-side from the bindings; the client passes only the bot prefix and conversation sha.",
+    request: z.object({
+      botId8: z.string().min(1),
+      conversationSha: z.string().min(1),
+      text: z.string().min(1),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string().nullable() }),
+    privileged: [WechatPrivileged.sendMessage],
+    async handler(ctx, args): Promise<{ ok: boolean; error: string | null }> {
+      const res = await ctx.executePrivileged(WechatPrivileged.sendMessage, {
+        botId8: args.botId8,
+        conversationSha: args.conversationSha,
+        text: args.text,
+      });
+      ctx.invalidateQueries();
+      return res;
+    },
+  }),
+
+  sendMedia: defineAction({
+    description:
+      "Sends one image/video/voice/file as the bot to the friend of the open conversation (optional caption text is sent first as its own text message), and records it in the conversation history. Images over 250KB are auto-compressed server-side before sending; the response reports whether compression ran and the before/after byte sizes. The file is uploaded as base64; the bot and target are resolved server-side from the bindings; the client passes only the bot prefix, conversation sha, filename, and bytes.",
+    request: z.object({
+      botId8: z.string().min(1),
+      conversationSha: z.string().min(1),
+      filename: z.string().min(1).max(255),
+      dataBase64: z.string().min(1),
+      mimeType: z.string().max(120),
+      caption: z.string().max(2000),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      compressed: z.boolean(),
+      originalBytes: z.number(),
+      finalBytes: z.number(),
+    }),
+    privileged: [WechatPrivileged.sendMedia],
+    async handler(
+      ctx,
+      args,
+    ): Promise<{
+      ok: boolean;
+      error: string | null;
+      compressed: boolean;
+      originalBytes: number;
+      finalBytes: number;
+    }> {
+      const res = await ctx.executePrivileged(WechatPrivileged.sendMedia, {
+        botId8: args.botId8,
+        conversationSha: args.conversationSha,
+        filename: args.filename,
+        dataBase64: args.dataBase64,
+        mimeType: args.mimeType,
+        caption: args.caption,
+      });
+      ctx.invalidateQueries();
+      return res;
+    },
+  }),
+
+  setPaused: defineAction({
+    description:
+      "Pauses or resumes the bot's automatic replies for one conversation. Paused means the worker records the friend's incoming messages but sends no reply; the user replies manually from the viewer.",
+    request: z.object({
+      botId8: z.string().min(1),
+      conversationSha: z.string().min(1),
+      paused: z.boolean(),
+    }),
+    response: z.object({ paused: z.boolean(), error: z.string().nullable() }),
+    privileged: [WechatPrivileged.setPaused],
+    async handler(
+      ctx,
+      args,
+    ): Promise<{ paused: boolean; error: string | null }> {
+      const res = await ctx.executePrivileged(WechatPrivileged.setPaused, {
+        botId8: args.botId8,
+        conversationSha: args.conversationSha,
+        paused: args.paused,
+      });
+      ctx.invalidateQueries();
+      return res;
+    },
+  }),
+
+  getPaused: defineAction({
+    description:
+      "Reports whether automatic replies are currently paused for one conversation.",
+    request: z.object({
+      botId8: z.string().min(1),
+      conversationSha: z.string().min(1),
+    }),
+    response: z.object({ paused: z.boolean(), error: z.string().nullable() }),
+    privileged: [WechatPrivileged.getPaused],
+    async handler(
+      ctx,
+      args,
+    ): Promise<{ paused: boolean; error: string | null }> {
+      return ctx.executePrivileged(WechatPrivileged.getPaused, {
+        botId8: args.botId8,
+        conversationSha: args.conversationSha,
+      });
     },
   }),
 } satisfies ActionsModule;

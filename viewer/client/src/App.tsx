@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { fileToBase64 } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
 
 type Overview = ApiResponse<typeof api, "getOverview">;
@@ -45,8 +46,67 @@ const PATHS = {
   x: "M18 6 6 18M6 6l12 12",
   check: "M20 6 9 17l-5-5",
   message: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
-  play: "M6 4l14 8-14 8V4Z",
+  mic: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z M19 10v2a7 7 0 0 1-14 0v-2 M12 19v3",
+  download: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4 M7 10l5 5 5-5 M12 15V3",
+  file: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6",
+  paperclip:
+    "M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48",
 };
+
+/** Human-readable file size for the attachment chip (B / KB / MB). */
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Client-side attachment rules, mirroring the server (which re-checks
+ * everything): video (mp4/mov/webm) is capped at 5 MiB by the platform,
+ * voice can only be an existing .silk file, and nothing over 20 MiB goes
+ * out at all.
+ * Returns the error to show, or null when the file may be sent.
+ */
+function validateAttachment(file: File): string | null {
+  const dot = file.name.lastIndexOf(".");
+  const ext = dot > 0 ? file.name.slice(dot + 1).toLowerCase() : "";
+  if (ext === "mp3") return "语音只能发 .silk 文件，mp3 发不出去";
+  if (["m4a", "wav", "ogg", "aac", "flac", "amr"].includes(ext))
+    return "语音只能发 .silk 文件，当前音频格式发不出去";
+  if (
+    (ext === "mp4" || ext === "mov" || ext === "webm") &&
+    file.size > 5 * 1024 * 1024
+  )
+    return "视频超过 5MB，平台发不出去，请压缩或裁剪后再发";
+  if (file.size > 20 * 1024 * 1024)
+    return "文件太大（超过 20MB），发不出去";
+  return null;
+}
+
+/**
+ * Client-side .silk magic check, mirroring the server and CLI rule: a
+ * voice file must start with the SILK_V3 magic at offset 0 or 1 (real
+ * WeChat .silk files carry a leading 0x02 byte). Only the first 10 bytes
+ * are read, so a bad file is rejected before the base64 upload starts.
+ * Returns the error to show, or null when the file passes (or is not .silk).
+ */
+async function validateSilkMagic(file: File): Promise<string | null> {
+  if (!file.name.toLowerCase().endsWith(".silk")) return null;
+  let head: string;
+  try {
+    const buf = await file.slice(0, 10).arrayBuffer();
+    head = new TextDecoder("ascii").decode(buf);
+  } catch {
+    return "语音文件读取失败，请重新选择";
+  }
+  if (
+    !head.startsWith("#!SILK_V3") &&
+    !head.slice(1).startsWith("#!SILK_V3")
+  ) {
+    return "语音只能发 .silk 文件，当前文件不是有效的 .silk 格式";
+  }
+  return null;
+}
 
 /* ---------- avatars ---------- */
 
@@ -89,81 +149,98 @@ function SideAvatar({ side, size = 38 }: { side: "muse" | "wechat"; size?: numbe
   );
 }
 
-/* ---------- time formatting ---------- */
+/* ---------- time formatting ----------
+ * Every displayed time is Beijing time (Asia/Shanghai, UTC+8), no matter
+ * which offset the stored ts carried and no matter which timezone the
+ * viewer's browser is in. All fields come from Intl.DateTimeFormat pinned
+ * to Asia/Shanghai — never from Date's local getters. */
 
-function parseTs(ts: string): Date | null {
-  if (!ts) return null;
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
+const BEIJING_TZ = "Asia/Shanghai";
 
-/* All displayed times are pinned to Beijing time (Asia/Shanghai):
-   WeChat is a Chinese app, so the viewer never follows the opening
-   device's timezone. Stored timestamps are absolute instants; only
-   the formatting is pinned here. */
 const beijingPartsFmt = new Intl.DateTimeFormat("en-US", {
-  timeZone: "Asia/Shanghai",
-  hourCycle: "h23",
+  timeZone: BEIJING_TZ,
   year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
+  month: "numeric",
+  day: "numeric",
   hour: "2-digit",
   minute: "2-digit",
+  hourCycle: "h23",
 });
 
-interface BeijingTime {
+interface BeijingParts {
   year: number;
-  month: number;
+  month: number; // 1-12
   day: number;
-  hour: number;
-  minute: number;
+  hour: string; // "00"-"23", zero-padded
+  minute: string; // "00"-"59", zero-padded
 }
 
-function beijingTime(d: Date): BeijingTime {
-  const parts = beijingPartsFmt.formatToParts(d);
-  const get = (type: string): number =>
-    Number(parts.find((part) => part.type === type)?.value ?? 0);
+function beijingParts(d: Date): BeijingParts {
+  const fields: Record<string, string> = {};
+  for (const part of beijingPartsFmt.formatToParts(d)) {
+    fields[part.type] = part.value;
+  }
   return {
-    year: get("year"),
-    month: get("month"),
-    day: get("day"),
-    hour: get("hour") % 24,
-    minute: get("minute"),
+    year: Number(fields.year),
+    month: Number(fields.month),
+    day: Number(fields.day),
+    hour: fields.hour ?? "00",
+    minute: fields.minute ?? "00",
   };
 }
 
-function beijingDaySerial(bt: BeijingTime): number {
-  return Math.round(Date.UTC(bt.year, bt.month - 1, bt.day) / 86400000);
+function parseTs(ts: string): Date | null {
+  if (!ts) return null;
+  const raw = ts.trim();
+  // A timestamp with no offset is in Beijing time per the history format;
+  // pin it before parsing, otherwise Date reads it as browser-local time.
+  const hasTime = /[T ]\d{2}:\d{2}/.test(raw);
+  const hasOffset = /(?:Z|[+-]\d{2}:?\d{2})\s*$/i.test(raw);
+  const candidate =
+    hasTime && !hasOffset ? `${raw.replace(" ", "T")}+08:00` : raw;
+  const d = new Date(candidate);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 function dayKey(d: Date): string {
-  const bt = beijingTime(d);
-  return `${bt.year}-${bt.month - 1}-${bt.day}`;
+  const p = beijingParts(d);
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+/** Beijing calendar-day number, for 今天/昨天 comparisons by Beijing date. */
+function beijingDayNumber(d: Date): number {
+  const p = beijingParts(d);
+  return Date.UTC(p.year, p.month - 1, p.day) / 86400000;
 }
 
 function dayLabel(d: Date): string {
-  const bt = beijingTime(d);
-  const diffDays = beijingDaySerial(beijingTime(new Date())) - beijingDaySerial(bt);
-  const hm = `${String(bt.hour).padStart(2, "0")}:${String(
-    bt.minute,
-  ).padStart(2, "0")}`;
+  const p = beijingParts(d);
+  const diffDays = beijingDayNumber(new Date()) - beijingDayNumber(d);
+  const hm = `${p.hour}:${p.minute}`;
   if (diffDays === 0) return hm;
   if (diffDays === 1) return `昨天 ${hm}`;
-  return `${bt.year}年${bt.month}月${bt.day}日 ${hm}`;
+  return `${p.year}年${p.month}月${p.day}日 ${hm}`;
 }
 
 function clockLabel(d: Date): string {
-  const bt = beijingTime(d);
-  return `${String(bt.hour).padStart(2, "0")}:${String(
-    bt.minute,
-  ).padStart(2, "0")}`;
+  const p = beijingParts(d);
+  return `${p.hour}:${p.minute}`;
 }
 
 function dateLabel(ts: string): string {
   const d = parseTs(ts);
   if (!d) return "";
-  const bt = beijingTime(d);
-  return `${bt.year}年${bt.month}月${bt.day}日`;
+  const p = beijingParts(d);
+  return `${p.year}年${p.month}月${p.day}日`;
+}
+
+/** Current Beijing wall-clock time as ISO with +08:00 and no milliseconds —
+ *  the exact shape history lines use (for the optimistically appended
+ *  message the user just sent; the server line replaces it on refetch). */
+function beijingNowIso(): string {
+  return new Date(Date.now() + 8 * 60 * 60 * 1000)
+    .toISOString()
+    .replace(/\.\d{3}Z$/, "+08:00");
 }
 
 /* ---------- highlighted message text ---------- */
@@ -214,164 +291,200 @@ function HighlightedText({
   );
 }
 
-/* ---------- media attachments ---------- */
+/* ---------- message media attachments ---------- */
 
 type MediaItem = { kind: string; localPath: string };
+
 type ChatMessage = MessagesData["messages"][number];
 
-/* A message that carries attachments has no separate visible text when
- * its text is only the "[图片]"/"[视频]" placeholder the history format
- * stores for pure media messages — the attachment replaces it. Search
- * uses the same predicate (visibleTextOf), so a hidden placeholder can
- * never be counted as a hit the user cannot see. */
+/**
+ * A media message's stored text is often just the placeholder "[图片]",
+ * "[视频]", "[语音]" or "[文件]": the rendered attachment replaces that
+ * text, so the bubble hides it. Search uses the same visible-text view
+ * (visibleTextOf) — a hidden placeholder must not count as a search hit
+ * either.
+ */
 function hidesPlaceholderText(m: ChatMessage): boolean {
   if (!m.media || m.media.length === 0) return false;
   const t = m.text.trim();
-  return t === "[图片]" || t === "[视频]";
+  return (
+    t === "[图片]" || t === "[视频]" || t === "[语音]" || t === "[文件]"
+  );
 }
 
 function visibleTextOf(m: ChatMessage): string {
   return hidesPlaceholderText(m) ? "" : m.text;
 }
 
-/* Blob URLs for fetched media, keyed by localPath. The chat polls every
- * 8s and re-renders, so without this cache every poll would re-fetch (and
- * re-decode) every image/video. Blob URLs live until the page is closed;
- * the viewer only ever holds a handful of media files at once. */
-const mediaObjectUrls = new Map<string, string>();
+/**
+ * Fetched media files, cached by localPath at module level: a file is
+ * fetched through the getMedia action exactly once, no matter how often the
+ * 8-second poll re-renders the conversation. `null` = fetch failed / file
+ * gone, rendered as a quiet fallback line. The served MIME type rides along
+ * because voice rendering depends on it: the server may hand back an .mp3
+ * transcode for a .silk path, and only a playable audio MIME gets a player.
+ */
+type FetchedMedia = { url: string; mimeType: string };
 
-function base64ToObjectUrl(base64: string, mime: string): string {
-  const bin = atob(base64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return URL.createObjectURL(
-    new Blob([bytes], { type: mime || "application/octet-stream" }),
-  );
-}
+const mediaUrlCache = new Map<string, Promise<FetchedMedia | null>>();
 
-function fileNameOf(path: string): string {
-  const idx = path.lastIndexOf("/");
-  return idx >= 0 ? path.slice(idx + 1) : path;
-}
-
-/** Fetches one media file (when enabled) and memoizes its Blob URL. */
-function useMediaUrl(localPath: string, enabled: boolean) {
-  const q = useQuery({
-    queryKey: ["media", localPath],
-    queryFn: () => api.getMedia({ localPath }),
-    staleTime: Infinity,
-    retry: false,
-    enabled,
-  });
-  const data = q.data;
-  const url = useMemo(() => {
-    if (!data?.found || !data.base64) return null;
-    const cached = mediaObjectUrls.get(localPath);
-    if (cached) return cached;
-    const created = base64ToObjectUrl(data.base64, data.mime);
-    mediaObjectUrls.set(localPath, created);
-    return created;
-  }, [data, localPath]);
-  return { q, data, url };
+function fetchMediaUrl(localPath: string): Promise<FetchedMedia | null> {
+  let pending = mediaUrlCache.get(localPath);
+  if (!pending) {
+    pending = api
+      .getMedia({ localPath })
+      .then((res) => {
+        if (!res.found || !res.dataBase64) return null;
+        const binary = atob(res.dataBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        const mimeType = res.mimeType || "application/octet-stream";
+        return {
+          url: URL.createObjectURL(new Blob([bytes], { type: mimeType })),
+          mimeType,
+        };
+      })
+      .catch(() => null);
+    mediaUrlCache.set(localPath, pending);
+  }
+  return pending;
 }
 
 /**
- * Renders one media attachment from a history line's media field.
- * Images show inline, videos get a player. Voice arrives as .silk, which
- * no browser can play: the server swaps in a same-name .mp3 transcode
- * when one exists, and only then does this render a real audio player —
- * otherwise it falls back to a voice chip (the transcript is in the
- * message text). Files are fetched only after the user clicks: the click
- * starts the fetch and the download follows as soon as the data arrives.
+ * Media fetch as a query, gated by `enabled`: with enabled=false nothing is
+ * fetched at all (file attachments wait for an explicit download tap).
+ * `data` keeps the old tri-state — undefined while loading or not yet
+ * wanted, null when the fetch failed, the FetchedMedia when it succeeded.
  */
-function MediaAttachment({ media }: { media: MediaItem }) {
-  const isFile = media.kind === "file";
-  const [wanted, setWanted] = useState(false);
-  const { q, data, url } = useMediaUrl(media.localPath, !isFile || wanted);
-  const downloadStarted = useRef(false);
+function useMediaUrl(localPath: string, enabled = true) {
+  const q = useQuery({
+    queryKey: ["media", localPath],
+    queryFn: () => fetchMediaUrl(localPath),
+    enabled,
+    staleTime: Infinity,
+  });
+  const data: FetchedMedia | null | undefined = enabled ? q.data : undefined;
+  return { q, data, url: data?.url };
+}
 
+function mediaFilename(localPath: string): string {
+  const name = localPath.split("/").pop() ?? "";
+  return name || "附件";
+}
+
+function MediaView({ item }: { item: MediaItem }) {
+  if (item.kind === "voice") {
+    return <VoiceMediaView item={item} />;
+  }
+  return <FetchedMediaView item={item} />;
+}
+
+function VoiceMediaView({ item }: { item: MediaItem }) {
+  const { data: media } = useMediaUrl(item.localPath);
+  // The server serves a same-named .mp3 transcode when one exists; only
+  // then is there a browser-playable audio stream. A raw .silk (or a failed
+  // fetch) falls back to the marker — the transcription is the message text.
+  const playable =
+    media != null &&
+    media.mimeType.startsWith("audio/") &&
+    media.mimeType !== "audio/silk";
+  if (playable) {
+    return (
+      <audio
+        src={media.url}
+        controls
+        preload="metadata"
+        aria-label="语音消息"
+        className="mb-1 max-w-full"
+      />
+    );
+  }
+  return (
+    <span className="mb-1 flex items-center gap-1.5 text-xs opacity-80">
+      <Icon d={PATHS.mic} className="h-4 w-4" />
+      语音消息（转写见正文）
+    </span>
+  );
+}
+
+function FetchedMediaView({ item }: { item: MediaItem }) {
+  const isFile = item.kind !== "image" && item.kind !== "video";
+  /* Files are not fetched up front: the bubble shows a download button and
+   * the bytes are pulled only after the user taps it; once they arrive, the
+   * download starts on its own (downloadStarted fires it exactly once). */
+  const [wanted, setWanted] = useState(false);
+  const downloadStarted = useRef(false);
+  const { data: media } = useMediaUrl(item.localPath, !isFile || wanted);
   useEffect(() => {
-    if (!isFile || !wanted || !url || downloadStarted.current) return;
+    if (!isFile || !wanted || !media || downloadStarted.current) return;
     downloadStarted.current = true;
     const a = document.createElement("a");
-    a.href = url;
-    a.download = fileNameOf(media.localPath);
+    a.href = media.url;
+    a.download = mediaFilename(item.localPath);
     document.body.appendChild(a);
     a.click();
     a.remove();
-  }, [isFile, wanted, url, media.localPath]);
-
-  const kindLabel =
-    media.kind === "image"
-      ? "图片"
-      : media.kind === "video"
-        ? "视频"
-        : media.kind === "voice"
-          ? "语音"
-          : "文件";
-
+  }, [isFile, wanted, media, item.localPath]);
   if (isFile && !wanted) {
     return (
       <button
         type="button"
         onClick={() => setWanted(true)}
-        className="mt-1.5 inline-block text-xs underline opacity-80"
+        className="flex items-center gap-2 py-1 underline decoration-dotted underline-offset-2"
       >
-        下载 {fileNameOf(media.localPath)}
+        <Icon d={PATHS.file} className="h-5 w-5 shrink-0" />
+        <span className="min-w-0 break-all text-sm">
+          下载 {mediaFilename(item.localPath)}
+        </span>
+        <Icon d={PATHS.download} className="h-4 w-4 shrink-0" />
       </button>
     );
   }
-  if (q.isPending) {
-    return <p className="mt-1.5 text-xs opacity-70">正在加载{kindLabel}…</p>;
+  if (media === undefined) {
+    return (
+      <span className="block py-2 text-xs opacity-70">媒体加载中…</span>
+    );
   }
-  if (q.isError || !data?.found || !url) {
-    return <p className="mt-1.5 text-xs opacity-70">（{kindLabel}未能加载）</p>;
+  if (media === null) {
+    return (
+      <span className="block py-2 text-xs opacity-70">媒体文件读取失败</span>
+    );
   }
-  if (media.kind === "image") {
+  const url = media.url;
+  if (item.kind === "image") {
     return (
       <img
         src={url}
-        alt="图片"
-        className="mt-1.5 max-h-72 w-auto max-w-full rounded-lg object-contain"
+        alt="消息中的图片"
+        className="max-h-72 max-w-full rounded-md"
+        loading="lazy"
       />
     );
   }
-  if (media.kind === "video") {
+  if (item.kind === "video") {
     return (
       <video
         src={url}
         controls
         preload="metadata"
-        playsInline
-        className="mt-1.5 max-h-72 w-full max-w-full rounded-lg bg-black"
+        aria-label="消息中的视频"
+        className="max-h-72 max-w-full rounded-md bg-black"
       />
-    );
-  }
-  if (media.kind === "voice") {
-    if (data.mime.startsWith("audio/") && data.mime !== "audio/silk") {
-      return (
-        <audio
-          controls
-          preload="metadata"
-          src={url}
-          className="mt-1.5 w-full max-w-[260px]"
-        />
-      );
-    }
-    return (
-      <span className="mt-1.5 flex items-center gap-1.5 text-xs opacity-80">
-        <Icon d={PATHS.play} className="h-3.5 w-3.5" />
-        语音消息（转写见文字）
-      </span>
     );
   }
   return (
     <a
       href={url}
-      download={fileNameOf(media.localPath)}
-      className="mt-1.5 inline-block text-xs underline opacity-80"
+      download={mediaFilename(item.localPath)}
+      className="flex items-center gap-2 py-1 underline decoration-dotted underline-offset-2"
     >
-      下载 {fileNameOf(media.localPath)}
+      <Icon d={PATHS.file} className="h-5 w-5 shrink-0" />
+      <span className="min-w-0 break-all text-sm">
+        {mediaFilename(item.localPath)}
+      </span>
+      <Icon d={PATHS.download} className="h-4 w-4 shrink-0" />
     </a>
   );
 }
@@ -530,6 +643,53 @@ export function App() {
   const [activeMatch, setActiveMatch] = useState(0);
   const [syncing, setSyncing] = useState(false);
   const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
+  /* Send box + pause toggle (chat view only) */
+  const [draft, setDraft] = useState("");
+  const [footerError, setFooterError] = useState<string | null>(null);
+  const [sendNotice, setSendNotice] = useState<string | null>(null);
+  const optimisticRef = useRef<ChatMessage | null>(null);
+  /* File attach (image/video/.silk): the picked file, its preview object
+   * URL for the thumbnail, and the hidden file input the attach button
+   * opens. The preview URL also lives in a ref so cleanup never reads a
+   * stale render's value. */
+  const [attachedFile, setAttachedFile] = useState<File | null>(null);
+  const [attachPreview, setAttachPreview] = useState<string | null>(null);
+  const attachPreviewRef = useRef<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  function setPreview(url: string | null) {
+    if (attachPreviewRef.current) {
+      URL.revokeObjectURL(attachPreviewRef.current);
+    }
+    attachPreviewRef.current = url;
+    setAttachPreview(url);
+  }
+
+  function clearAttachment() {
+    setPreview(null);
+    setAttachedFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  async function onFileSelected(file: File | undefined) {
+    if (!file) return;
+    const err = validateAttachment(file);
+    if (err) {
+      setFooterError(err);
+      return;
+    }
+    // .silk magic is checked here (first 10 bytes) so a bad voice file is
+    // rejected before the base64 upload; the server re-checks it anyway.
+    const silkErr = await validateSilkMagic(file);
+    if (silkErr) {
+      setFooterError(silkErr);
+      return;
+    }
+    setAttachedFile(file);
+    setPreview(URL.createObjectURL(file));
+    setFooterError(null);
+    setSendNotice(null);
+  }
   /* Unread tracking: `seenThrough` is how many messages of the open
    * conversation count as seen *this visit* — it drives the new-message
    * divider and the "start at the first new message" landing. The overview's
@@ -578,6 +738,147 @@ export function App() {
 
   const msgs = useMemo(() => messages.data?.messages ?? [], [messages.data]);
 
+  /* ---- pause state + send box ---- */
+  const messagesKey = ["messages", bot?.id ?? "", conversation?.id ?? ""] as const;
+  const pausedKey = ["paused", bot?.id ?? "", bot?.conversationSha ?? ""] as const;
+
+  const pausedQuery = useQuery({
+    queryKey: pausedKey,
+    queryFn: () =>
+      api.getPaused({
+        botId8: bot?.id.slice(0, 8) ?? "",
+        conversationSha: bot?.conversationSha ?? "",
+      }),
+    enabled: inChat,
+    refetchInterval: POLL_MS,
+  });
+  const paused = pausedQuery.data?.paused ?? false;
+
+  function removeOptimistic() {
+    const opt = optimisticRef.current;
+    if (!opt) return;
+    optimisticRef.current = null;
+    queryClient.setQueryData<MessagesData>(messagesKey, (old) =>
+      old ? { ...old, messages: old.messages.filter((m) => m !== opt) } : old,
+    );
+  }
+
+  const sendMutation = useMutation({
+    mutationFn: (text: string) =>
+      api.sendMessage({
+        botId8: bot?.id.slice(0, 8) ?? "",
+        conversationSha: bot?.conversationSha ?? "",
+        text,
+      }),
+    onMutate: (text) => {
+      // Show the message right away; the 8s poll (or the success refetch)
+      // replaces it with the line the server wrote to the history file.
+      const optimistic: ChatMessage = {
+        ts: beijingNowIso(),
+        role: "assistant",
+        text,
+      };
+      optimisticRef.current = optimistic;
+      queryClient.setQueryData<MessagesData>(messagesKey, (old) =>
+        old ? { ...old, messages: [...old.messages, optimistic] } : old,
+      );
+    },
+    onError: () => {
+      removeOptimistic();
+      setFooterError("发送失败，请再试一次");
+    },
+    onSuccess: (res) => {
+      if (!res.ok) {
+        removeOptimistic();
+        setFooterError(res.error ?? "发送失败，请再试一次");
+        return;
+      }
+      optimisticRef.current = null;
+      setFooterError(null);
+      void queryClient.invalidateQueries({ queryKey: ["messages"] });
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
+    },
+  });
+
+  /* File send: the picked file goes up as base64 (the SDK's fileToBase64
+   * shape) and the server saves it into this bot's media dir, calls the
+   * CLI's send-media, and records the caption + media lines. The caption
+   * is optimistically appended like a text send; the media line itself
+   * appears on the success refetch (its server-side filename is only
+   * known after the upload). A failed send keeps the attachment in place
+   * so the user can retry. */
+  const sendMediaMutation = useMutation({
+    mutationFn: async (args: { file: File; caption: string }) => {
+      const { dataBase64, mimeType } = await fileToBase64(args.file);
+      return api.sendMedia({
+        botId8: bot?.id.slice(0, 8) ?? "",
+        conversationSha: bot?.conversationSha ?? "",
+        filename: args.file.name,
+        dataBase64,
+        mimeType,
+        caption: args.caption,
+      });
+    },
+    onMutate: (args) => {
+      if (args.caption.trim()) {
+        const optimistic: ChatMessage = {
+          ts: beijingNowIso(),
+          role: "assistant",
+          text: args.caption.trim(),
+        };
+        optimisticRef.current = optimistic;
+        queryClient.setQueryData<MessagesData>(messagesKey, (old) =>
+          old ? { ...old, messages: [...old.messages, optimistic] } : old,
+        );
+      }
+    },
+    onError: () => {
+      removeOptimistic();
+      setFooterError("发送失败，请再试一次");
+    },
+    onSuccess: (res) => {
+      if (!res.ok) {
+        removeOptimistic();
+        setFooterError(res.error ?? "发送失败，请再试一次");
+        return;
+      }
+      optimisticRef.current = null;
+      setFooterError(null);
+      setSendNotice(
+        res.compressed
+          ? `图片较大，已自动压缩后发送（${formatFileSize(res.originalBytes)} → ${formatFileSize(res.finalBytes)}）`
+          : null,
+      );
+      clearAttachment();
+      setDraft("");
+      void queryClient.invalidateQueries({ queryKey: ["messages"] });
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
+    },
+  });
+
+  const pauseMutation = useMutation({
+    mutationFn: (next: boolean) =>
+      api.setPaused({
+        botId8: bot?.id.slice(0, 8) ?? "",
+        conversationSha: bot?.conversationSha ?? "",
+        paused: next,
+      }),
+    onSuccess: (res) => {
+      if (res.error) {
+        setFooterError(res.error);
+        return;
+      }
+      setFooterError(null);
+      queryClient.setQueryData(pausedKey, {
+        paused: res.paused,
+        error: null,
+      });
+    },
+    onError: () => {
+      setFooterError("切换暂停状态失败，请再试一次");
+    },
+  });
+
   /* ---- unread bookkeeping ---- */
   const seenMutation = useMutation({
     mutationFn: (args: {
@@ -609,11 +910,11 @@ export function App() {
   }
 
   /* While the user sits at the bottom of the open chat, anything that
-   * arrives is on screen — count it as seen so the badges keep up.
-   * Paused while a resume jump is still armed: marking everything seen
-   * before the jump lands would wipe the unread divider, the "N 条新消息"
-   * button and the badges before the user has seen any of it. */
+   * arrives is on screen — count it as seen so the badges keep up. */
   useEffect(() => {
+    /* While a resume jump to the first unread message is still armed, pause
+     * marking seen: clearing the position early would wipe the new-message
+     * divider and the unread badges before the user ever lands there. */
     if (resumeArmedRef.current) return;
     if (inChat && pinnedToBottom.current && msgs.length > 0) {
       markSeenThrough(msgs.length);
@@ -626,10 +927,10 @@ export function App() {
    * to the first new message instead of the newest one. */
   useEffect(() => {
     if (!inChat || !resumeArmedRef.current || msgs.length === 0) return;
-    // Stay armed until the resume point actually exists in the loaded
-    // messages; disarming earlier would hand control back to the
-    // mark-all-seen effect above with nothing landed yet.
     if (resumeIndex < 0 || resumeIndex >= msgs.length) return;
+    /* Disarm only once the landing point is really among the loaded
+     * messages; disarming earlier (on a not-yet-loaded index) would lose
+     * the jump and let mark-seen clear the unread state prematurely. */
     resumeArmedRef.current = false;
     pinnedToBottom.current = false;
     requestAnimationFrame(() => {
@@ -648,11 +949,7 @@ export function App() {
     const q = query.toLowerCase();
     const out: number[] = [];
     msgs.forEach((m, i) => {
-      // Same visible-text predicate as the rendering: a placeholder the
-      // bubble hides ("[图片]"/"[视频]" on a message with attachments)
-      // must not count as a hit — the user could never see it.
-      const visible = visibleTextOf(m);
-      if (visible && visible.toLowerCase().includes(q)) out.push(i);
+      if (visibleTextOf(m).toLowerCase().includes(q)) out.push(i);
     });
     return out;
   }, [msgs, query]);
@@ -737,6 +1034,10 @@ export function App() {
     setSelectedConvId(c.id);
     setSearch("");
     setActiveMatch(0);
+    setDraft("");
+    clearAttachment();
+    setFooterError(null);
+    setSendNotice(null);
     /* Land on the first message the user has not seen yet (when there is
      * one); with nothing unread the chat opens at the newest message. */
     const seen = Math.max(0, c.messageCount - c.unreadCount);
@@ -1009,6 +1310,8 @@ export function App() {
   }
 
   const remainingUnread = Math.max(0, msgs.length - seenThrough);
+  /* Either send path in flight disables the whole send box. */
+  const sending = sendMutation.isPending || sendMediaMutation.isPending;
 
   return (
     <div className="flex h-dvh flex-col bg-[var(--bg)] text-[var(--text)]">
@@ -1178,6 +1481,13 @@ export function App() {
                           : "rounded-lg rounded-tl-sm bg-[var(--surface)] text-[var(--text)]"
                       } ${isActive ? "ring-2 ring-amber-400 ring-offset-1" : ""}`}
                     >
+                      {m.media && m.media.length > 0 ? (
+                        <div className={hidesPlaceholderText(m) ? "" : "pb-1.5"}>
+                          {m.media.map((item, k) => (
+                            <MediaView key={k} item={item} />
+                          ))}
+                        </div>
+                      ) : null}
                       {hidesPlaceholderText(m) ? null : (
                         <HighlightedText
                           text={m.text}
@@ -1185,18 +1495,137 @@ export function App() {
                           isActiveMatch={isActive}
                         />
                       )}
-                      {m.media?.map((item, k) => (
-                        <MediaAttachment
-                          key={`${item.localPath}-${k}`}
-                          media={item}
-                        />
-                      ))}
                     </div>
                   </div>
                 </div>
               );
             })
           )}
+        </div>
+      </div>
+
+      {/* ----- send box + pause toggle ----- */}
+      <div className="shrink-0 border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3 pb-safe">
+        <div className="mx-auto w-full max-w-3xl">
+          {paused ? (
+            <p className="mb-2 rounded-md bg-amber-100 px-3 py-1.5 text-xs text-amber-800">
+              自动回复已暂停：朋友发来的消息只会记录，不会自动回。你可以在这里手动回。
+            </p>
+          ) : null}
+          {attachedFile ? (
+            <div className="mb-2 flex items-center gap-2 rounded-md border border-[var(--border)] bg-[var(--chip)] px-2 py-1.5">
+              {attachPreview && attachedFile.type.startsWith("image/") ? (
+                <img
+                  src={attachPreview}
+                  alt="待发送的图片预览"
+                  className="h-10 w-10 shrink-0 rounded object-cover"
+                />
+              ) : (
+                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded bg-[var(--surface)] text-[var(--dim)]">
+                  <Icon d={PATHS.file} className="h-5 w-5" />
+                </span>
+              )}
+              <span className="min-w-0 flex-1 truncate text-xs text-[var(--text)]">
+                {attachedFile.name} · {formatFileSize(attachedFile.size)}
+              </span>
+              <button
+                type="button"
+                onClick={clearAttachment}
+                disabled={sending}
+                aria-label="移除附件"
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--dim)] disabled:opacity-50"
+              >
+                <Icon d={PATHS.x} className="h-4 w-4" />
+              </button>
+            </div>
+          ) : null}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (sending) return;
+              const caption = draft.trim();
+              if (attachedFile) {
+                setDraft("");
+                sendMediaMutation.mutate({ file: attachedFile, caption });
+                return;
+              }
+              if (!caption) return;
+              setDraft("");
+              sendMutation.mutate(caption);
+            }}
+            className="flex items-center gap-2"
+          >
+            <button
+              type="button"
+              onClick={() => pauseMutation.mutate(!paused)}
+              disabled={pauseMutation.isPending || pausedQuery.isPending}
+              aria-pressed={paused}
+              title={paused ? "恢复自动回复" : "暂停自动回复"}
+              className={`h-10 shrink-0 rounded-md px-3 text-sm font-medium disabled:opacity-50 ${
+                paused
+                  ? "bg-[var(--unread)] text-white"
+                  : "border border-[var(--border)] text-[var(--dim)]"
+              }`}
+            >
+              {paused ? "已暂停，点击恢复" : "暂停自动回复"}
+            </button>
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={sending}
+              aria-label="添加图片或视频"
+              title="添加图片或视频"
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[var(--border)] text-[var(--dim)] disabled:opacity-50"
+            >
+              <Icon d={PATHS.paperclip} className="h-5 w-5" />
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*,video/*,.silk"
+              aria-label="选择要发送的图片或视频"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                onFileSelected(f);
+              }}
+            />
+            <label htmlFor="send-input" className="sr-only">
+              发消息
+            </label>
+            <input
+              id="send-input"
+              value={draft}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                if (footerError) setFooterError(null);
+              }}
+              placeholder={
+                attachedFile
+                  ? "给这个文件加一句说明（可选，先发过去）…"
+                  : paused
+                    ? "手动回复（自动回复已暂停）…"
+                    : "替机器人回一句话…"
+              }
+              maxLength={2000}
+              autoComplete="off"
+              className="min-w-0 flex-1 rounded-md border border-[var(--border)] bg-[var(--chip)] px-3 py-2.5 text-[15px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
+            />
+            <button
+              type="submit"
+              disabled={(!draft.trim() && !attachedFile) || sending}
+              className="h-10 shrink-0 rounded-md bg-[var(--accent)] px-4 text-sm font-medium text-white disabled:opacity-50"
+            >
+              {sending ? "发送中…" : "发送"}
+            </button>
+          </form>
+          {sendNotice ? (
+            <p className="pt-2 text-xs text-[var(--current-text)]">{sendNotice}</p>
+          ) : null}
+          {footerError ? (
+            <p className="pt-2 text-xs text-red-500">{footerError}</p>
+          ) : null}
         </div>
       </div>
     </div>

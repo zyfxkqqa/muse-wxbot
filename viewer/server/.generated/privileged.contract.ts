@@ -12,6 +12,7 @@ export const WechatPrivileged = definePrivilegedContracts({
           displayName: z.string(),
           platformBotId: z.string(),
           ownerExternalId: z.string(),
+          conversationSha: z.string(),
           createdAt: z.string(),
           lastError: z.string().nullable(),
           conversations: z.array(
@@ -40,13 +41,12 @@ export const WechatPrivileged = definePrivilegedContracts({
           ts: z.string(),
           role: z.string(),
           text: z.string(),
+          // NOTE: inlined rather than z.array(mediaItemSchema) — the build
+          // extracts this contract literal into a generated file that does
+          // not carry local consts, so a reference here fails typecheck.
+          // The shape is identical to mediaItemSchema.
           media: z
-            .array(
-              z.object({
-                kind: z.string(),
-                localPath: z.string(),
-              }),
-            )
+            .array(z.object({ kind: z.string(), localPath: z.string() }))
             .optional(),
         }),
       ),
@@ -58,9 +58,59 @@ export const WechatPrivileged = definePrivilegedContracts({
     }),
     response: z.object({
       found: z.boolean(),
-      mime: z.string(),
-      base64: z.string(),
+      dataBase64: z.string(),
+      mimeType: z.string(),
       size: z.number(),
+      filename: z.string(),
+    }),
+  },
+  sendMessage: {
+    request: z.object({
+      botId8: z.string(),
+      conversationSha: z.string(),
+      text: z.string(),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+    }),
+  },
+  sendMedia: {
+    request: z.object({
+      botId8: z.string(),
+      conversationSha: z.string(),
+      filename: z.string(),
+      dataBase64: z.string(),
+      mimeType: z.string(),
+      caption: z.string(),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      compressed: z.boolean(),
+      originalBytes: z.number(),
+      finalBytes: z.number(),
+    }),
+  },
+  setPaused: {
+    request: z.object({
+      botId8: z.string(),
+      conversationSha: z.string(),
+      paused: z.boolean(),
+    }),
+    response: z.object({
+      paused: z.boolean(),
+      error: z.string().nullable(),
+    }),
+  },
+  getPaused: {
+    request: z.object({
+      botId8: z.string(),
+      conversationSha: z.string(),
+    }),
+    response: z.object({
+      paused: z.boolean(),
+      error: z.string().nullable(),
     }),
   },
 });

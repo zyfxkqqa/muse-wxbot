@@ -32,7 +32,10 @@ export class WechatClawbotProvisioner {
     let currentBaseUrl = this.deps.api.defaultBaseUrl();
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const status = await this.pollWechatLoginStatus(currentBaseUrl, login.qrcode, options.onStatus);
+      // P9 (L15): --timeout-ms is only approximate if a single 75s status
+      // query can overshoot it — cap each query by the time remaining.
+      const remainingMs = deadline - Date.now();
+      const status = await this.pollWechatLoginStatus(currentBaseUrl, login.qrcode, options.onStatus, Math.min(75_000, remainingMs));
       if (!status) {
         await this.sleep(1200);
         continue;
@@ -51,6 +54,27 @@ export class WechatClawbotProvisioner {
         throw new Error("该微信 ClawBot 已连接过其他 OpenClaw/网关，请先在微信侧解除后再绑定。");
       } else if (status.status === "confirmed") {
         const binding = await this.finishBinding(currentBaseUrl, status);
+        // M10: establish the getUpdates cursor right after binding, with
+        // one ~25s long-poll (the same manual step that had to be done by
+        // hand on 2026-11-10, now built in) — so a newly bound bot does not
+        // depend on the hook's first 6s poll to create its cursor. Best
+        // effort: if the long-poll times out with no messages (the normal
+        // idle case) or errors, the binding still stands and the hook's
+        // first poll establishes the cursor as before.
+        try {
+          const res = await this.deps.api.getUpdates({
+            baseUrl: currentBaseUrl,
+            token: binding.token,
+            getUpdatesBuf: "",
+            timeoutMs: 25_000
+          });
+          if (res.get_updates_buf) {
+            binding.metadata = { ...(binding.metadata ?? {}), getUpdatesBuf: res.get_updates_buf };
+            await this.deps.store.save(binding);
+          }
+        } catch {
+          /* ignore — cursor will be established by the hook's first poll */
+        }
         await options.onStatus?.({ phase: "WECHAT_CONFIRMED", message: "微信机器人开通成功。" });
         return binding;
       }
@@ -59,6 +83,11 @@ export class WechatClawbotProvisioner {
     throw new Error("微信 ClawBot 扫码超时，请重新发起绑定。");
   }
 
+  /**
+   * @deprecated Legacy polling path — nothing calls it. The only polling
+   * path in production is the hook (`wechat-inbox.sh`) driving
+   * `wechat-bot poll` / `poll-all` (CLI pollBot). Do not wire this up.
+   */
   startPolling(
     bot: WechatBotBinding,
     handler: WechatMessageHandler,
@@ -69,6 +98,9 @@ export class WechatClawbotProvisioner {
     return { stop: () => abort.abort() };
   }
 
+  /**
+   * @deprecated See startPolling — legacy only, not used by the CLI or hook.
+   */
   async startPollingAll(handler: WechatMessageHandler, options: { timeoutMs?: number; intervalAfterErrorMs?: number } = {}) {
     const bots = await this.deps.store.listActive();
     return bots.map((bot) => this.startPolling(bot, handler, options));
@@ -99,10 +131,11 @@ export class WechatClawbotProvisioner {
   private async pollWechatLoginStatus(
     currentBaseUrl: string,
     qrcode: string,
-    onStatus?: (status: WechatProvisionStatus) => void | Promise<void>
+    onStatus?: (status: WechatProvisionStatus) => void | Promise<void>,
+    timeoutMs = 75_000
   ) {
     try {
-      return await this.deps.api.pollLoginStatus(currentBaseUrl, qrcode);
+      return await this.deps.api.pollLoginStatus(currentBaseUrl, qrcode, undefined, timeoutMs);
     } catch (error) {
       if (!this.isAbortError(error)) throw error;
       await onStatus?.({
@@ -149,6 +182,12 @@ export class WechatClawbotProvisioner {
     }
   }
 
+  /**
+   * @deprecated Legacy only — text-only, does NOT support media: a message
+   * with no text (image/voice/video/file) is silently dropped here. The
+   * production polling path is the CLI's pollBot, which handles media.
+   * Kept only because pollLoop references it; do not call directly.
+   */
   private async handleMessage(bot: WechatBotBinding, raw: WechatMessage, handler: WechatMessageHandler) {
     if (raw.message_type === 2) return;
     const fromUserId = raw.from_user_id?.trim();
